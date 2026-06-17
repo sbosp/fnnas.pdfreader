@@ -648,173 +648,165 @@ class UnixSocketServer(socketserver.UnixStreamServer):
         return sock, addr
 
 
-def create_unix_socket_app(app, sock_path):
-    """创建基于 Unix Socket 的 Flask 应用服务器"""
+class UnixSocketServer:
+    """基于 Unix Socket 的 WSGI 服务器"""
     
-    class UnixSocketServer:
-        def __init__(self, app, sock_path):
-            self.app = app
-            self.sock_path = sock_path
-            self.sock = None
-            self.running = False
+    def __init__(self, app, sock_path):
+        self.app = app
+        self.sock_path = sock_path
+        self.sock = None
+        self.running = False
+        self.server = None
 
-        def serve_forever(self):
-            # 清理旧的 socket 文件
+    def serve_forever(self):
+        # 清理旧的 socket 文件
+        if os.path.exists(self.sock_path):
+            os.unlink(self.sock_path)
+
+        # 创建 Unix Socket
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(self.sock_path)
+        self.sock.listen(128)
+        self.sock.settimeout(0.5)
+
+        # 设置 socket 文件权限，让 fnOS 网关可以访问
+        try:
+            os.chmod(self.sock_path, 0o777)
+        except OSError:
+            pass
+
+        self.running = True
+        log(f"Unix Socket listening on {self.sock_path}")
+
+        # 主循环
+        while self.running:
+            try:
+                client, addr = self.sock.accept()
+                # 在新线程中处理请求
+                t = threading.Thread(
+                    target=self._handle_client,
+                    args=(client,),
+                    daemon=True
+                )
+                t.start()
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if "Interrupted system call" not in str(e):
+                    break
+
+    def shutdown(self):
+        self.running = False
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
             if os.path.exists(self.sock_path):
                 os.unlink(self.sock_path)
 
-            # 创建 Unix Socket
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.bind(self.sock_path)
-            self.sock.listen(128)
-            self.sock.settimeout(0.5)
+    def _handle_client(self, client):
+        try:
+            # 读取请求行
+            request_line = b""
+            while b"\r\n" not in request_line:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return
+                request_line += chunk
 
-            # 设置 socket 文件权限，让 fnOS 网关可以访问
-            try:
-                os.chmod(self.sock_path, 0o777)
-            except OSError:
-                pass
+            if not request_line:
+                return
 
-            self.running = True
-            log(f"Unix Socket listening on {self.sock_path}")
+            # 解析请求
+            parts = request_line.decode("utf-8", errors="replace").split()
+            if len(parts) < 2:
+                return
 
-            # 主循环
-            while self.running:
-                try:
-                    client, addr = self.sock.accept()
-                    # 在新线程中处理请求
-                    t = threading.Thread(
-                        target=self._handle_client,
-                        args=(client,),
-                        daemon=True
-                    )
-                    t.start()
-                except socket.timeout:
-                    continue
-                except OSError as e:
-                    if "Interrupted system call" not in str(e):
-                        break
+            method, path, version = parts[0], parts[1], parts[2] if len(parts) > 2 else "HTTP/1.1"
 
-        def shutdown(self):
-            self.running = False
-            if self.sock:
-                try:
-                    self.sock.close()
-                except:
-                    pass
-                if os.path.exists(self.sock_path):
-                    os.unlink(self.sock_path)
-
-        def _handle_client(self, client):
-            try:
-                # 读取请求行
-                request_line = b""
-                while b"\r\n" not in request_line:
+            # 读取请求头
+            headers = {}
+            body = b""
+            while True:
+                line = b""
+                while b"\r\n" not in line:
                     chunk = client.recv(4096)
                     if not chunk:
                         return
-                    request_line += chunk
+                    line += chunk
 
-                if not request_line:
-                    return
+                if not line or line == b"\r\n":
+                    break
 
-                # 解析请求
-                parts = request_line.decode("utf-8", errors="replace").split()
-                if len(parts) < 2:
-                    return
+                line = line.decode("utf-8", errors="replace").strip()
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    headers[key.strip()] = value.strip()
 
-                method, path, version = parts[0], parts[1], parts[2] if len(parts) > 2 else "HTTP/1.1"
-
-                # 读取请求头
-                headers = {}
+            # 读取请求体
+            content_length = int(headers.get("Content-Length", 0))
+            if content_length > 0:
                 body = b""
-                while True:
-                    line = b""
-                    while b"\r\n" not in line:
-                        chunk = client.recv(4096)
-                        if not chunk:
-                            return
-                        line += chunk
-
-                    if not line or line == b"\r\n":
+                while len(body) < content_length:
+                    chunk = client.recv(min(4096, content_length - len(body)))
+                    if not chunk:
                         break
+                    body += chunk
 
-                    line = line.decode("utf-8", errors="replace").strip()
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        headers[key.strip()] = value.strip()
+            # 构建 WSGI environ
+            environ = {
+                "REQUEST_METHOD": method,
+                "PATH_INFO": path.split("?")[0],
+                "QUERY_STRING": path.split("?")[1] if "?" in path else "",
+                "SERVER_PROTOCOL": version,
+                "SERVER_NAME": "fnOS",
+                "SERVER_PORT": "80",
+                "wsgi.version": (1, 0),
+                "wsgi.input": io.BytesIO(body),
+                "wsgi.errors": sys.stderr,
+                "wsgi.multithread": True,
+                "wsgi.multiprocess": False,
+                "wsgi.run_once": False,
+                "wsgi.url_scheme": "http",
+                "CONTENT_LENGTH": str(len(body)),
+                "CONTENT_TYPE": headers.get("Content-Type", ""),
+            }
 
-                # 读取请求体
-                content_length = int(headers.get("Content-Length", 0))
-                if content_length > 0:
-                    body = b""
-                    while len(body) < content_length:
-                        chunk = client.recv(min(4096, content_length - len(body)))
-                        if not chunk:
-                            break
-                        body += chunk
+            # 添加所有请求头
+            for key, value in headers.items():
+                environ["HTTP_%s" % key.upper().replace("-", "_")] = value
 
-                # 构建 WSGI environ
-                environ = {
-                    "REQUEST_METHOD": method,
-                    "PATH_INFO": path.split("?")[0],
-                    "QUERY_STRING": path.split("?")[1] if "?" in path else "",
-                    "SERVER_PROTOCOL": version,
-                    "SERVER_NAME": "fnOS",
-                    "SERVER_PORT": "80",
-                    "wsgi.version": (1, 0),
-                    "wsgi.input": io.BytesIO(body),
-                    "wsgi.errors": sys.stderr,
-                    "wsgi.multithread": True,
-                    "wsgi.multiprocess": False,
-                    "wsgi.run_once": False,
-                    "wsgi.url_scheme": "http",
-                    "CONTENT_LENGTH": str(len(body)),
-                    "CONTENT_TYPE": headers.get("Content-Type", ""),
-                }
+            # 调用 WSGI 应用
+            from werkzeug.wrappers import Response
+            resp = Response.from_app(self.app, environ)
 
-                # 添加所有请求头
-                for key, value in headers.items():
-                    environ["HTTP_%s" % key.upper().replace("-", "_")] = value
+            # 发送响应
+            status_line = f"HTTP/1.1 {resp.status_code} {resp.status}\r\n"
+            client.send(status_line.encode())
 
-                # 调用 WSGI 应用
-                from werkzeug.wrappers import Response
-                resp = Response.from_app(self.app, environ)
+            for key, value in resp.headers:
+                client.send(f"{key}: {value}\r\n".encode())
+            client.send(b"\r\n")
 
-                # 发送响应
-                status_line = f"HTTP/1.1 {resp.status_code} {resp.status}\r\n"
-                client.send(status_line.encode())
+            # 发送响应体
+            for chunk in resp.response:
+                if isinstance(chunk, str):
+                    chunk = chunk.encode()
+                client.send(chunk)
 
-                for key, value in resp.headers:
-                    client.send(f"{key}: {value}\r\n".encode())
-                client.send(b"\r\n")
+            client.close()
 
-                # 发送响应体
-                for chunk in resp.response:
-                    if isinstance(chunk, str):
-                        chunk = chunk.encode()
-                    client.send(chunk)
-
+        except Exception as e:
+            log(f"handle_client error: {e}")
+            try:
                 client.close()
+            except:
+                pass
 
-            except Exception as e:
-                log(f"handle_client error: {e}")
-                try:
-                    client.close()
-                except:
-                    pass
-
-        def serve_forever(self):
-            self.start()
-
-        def shutdown(self):
-            if self.server:
-                try:
-                    self.server.close()
-                except:
-                    pass
-                if os.path.exists(self.sock_path):
-                    os.unlink(self.sock_path)
+def create_unix_socket_app(app, sock_path):
+    """创建基于 Unix Socket 的 Flask 应用服务器"""
+    return UnixSocketServer(app, sock_path)
 
 
 def main():
