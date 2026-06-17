@@ -17,17 +17,16 @@ PDF 阅读器 — Flask 版本 (fnOS 统一网关版)
   生产环境：由 fnOS 统一网关通过 Unix Socket 转发
 """
 import argparse
+import io
 import base64
 import hashlib
-import io
 import json
 import os
 import socket
-import struct
+import socketserver
 import sys
 import threading
 import time
-import urllib.parse
 
 from flask import Flask, request, jsonify, send_from_directory, send_file, abort
 import pymupdf
@@ -707,10 +706,6 @@ def create_unix_socket_app(app, sock_path):
                         break
 
         def _handle_client(self, client, handler_class, app):
-            import wsgiref.simple_server
-            import wsgiref.headers
-            import io
-
             try:
                 # 读取请求行
                 request_line = b""
