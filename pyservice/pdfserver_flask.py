@@ -669,9 +669,9 @@ class UnixSocketServer:
         self.sock.listen(128)
         self.sock.settimeout(0.5)
 
-        # 设置 socket 文件权限，让 fnOS 网关可以访问
+        # 设置 socket 文件权限为 0666，让 fnOS 网关 nginx worker 可以访问
         try:
-            os.chmod(self.sock_path, 0o777)
+            os.chmod(self.sock_path, 0o666)
         except OSError:
             pass
 
@@ -707,7 +707,7 @@ class UnixSocketServer:
 
     def _handle_client(self, client):
         try:
-            # 读取请求行
+            # 读取请求行（可能包含 HAProxy Protocol v1/v2 前缀）
             request_line = b""
             while b"\r\n" not in request_line:
                 chunk = client.recv(4096)
@@ -721,6 +721,23 @@ class UnixSocketServer:
             # 去除 \r\n
             request_line = request_line.rstrip(b"\r\n")
             
+            # 检查是否是 HAProxy Protocol v1 (PROXY TCP4/6...)
+            if request_line.startswith(b"PROXY "):
+                # 解析 PROXY 协议，获取真实客户端信息
+                proxy_parts = request_line.decode("utf-8", errors="replace").split()
+                if len(proxy_parts) >= 6:
+                    log(f"HAProxy Protocol: {proxy_parts[1]} {proxy_parts[2]}:{proxy_parts[4]} -> {proxy_parts[3]}:{proxy_parts[5]}")
+                # 继续读取真正的 HTTP 请求行
+                request_line = b""
+                while b"\r\n" not in request_line:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        return
+                    request_line += chunk
+                if not request_line:
+                    return
+                request_line = request_line.rstrip(b"\r\n")
+
             # 解析请求
             parts = request_line.decode("utf-8", errors="replace").split()
             if len(parts) < 2:
