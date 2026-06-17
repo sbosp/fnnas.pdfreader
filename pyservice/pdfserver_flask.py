@@ -650,27 +650,24 @@ class UnixSocketServer(socketserver.UnixStreamServer):
 
 def create_unix_socket_app(app, sock_path):
     """创建基于 Unix Socket 的 Flask 应用服务器"""
-    from werkzeug.serving import make_server
     
-    class UnixSocketWSGIRefServer:
+    class UnixSocketServer:
         def __init__(self, app, sock_path):
             self.app = app
             self.sock_path = sock_path
-            self.server = None
+            self.sock = None
+            self.running = False
 
-        def start(self):
-            import wsgiref.simple_server
-            import wsgiref.validate
-
+        def serve_forever(self):
             # 清理旧的 socket 文件
             if os.path.exists(self.sock_path):
                 os.unlink(self.sock_path)
 
             # 创建 Unix Socket
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.bind(self.sock_path)
-            sock.listen(128)
-            sock.settimeout(0.5)
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.bind(self.sock_path)
+            self.sock.listen(128)
+            self.sock.settimeout(0.5)
 
             # 设置 socket 文件权限，让 fnOS 网关可以访问
             try:
@@ -678,24 +675,17 @@ def create_unix_socket_app(app, sock_path):
             except OSError:
                 pass
 
-            def app_wrapper(environ, start_response):
-                return self.app(environ, start_response)
-
-            # 使用 wsgiref 处理请求
-            handler = wsgiref.simple_server.WSGIRequestHandler
-            httpd = sock
-
-            self.server = httpd
+            self.running = True
             log(f"Unix Socket listening on {self.sock_path}")
 
             # 主循环
-            while True:
+            while self.running:
                 try:
-                    client, addr = httpd.accept()
+                    client, addr = self.sock.accept()
                     # 在新线程中处理请求
                     t = threading.Thread(
                         target=self._handle_client,
-                        args=(client, handler, app_wrapper),
+                        args=(client,),
                         daemon=True
                     )
                     t.start()
@@ -705,7 +695,17 @@ def create_unix_socket_app(app, sock_path):
                     if "Interrupted system call" not in str(e):
                         break
 
-        def _handle_client(self, client, handler_class, app):
+        def shutdown(self):
+            self.running = False
+            if self.sock:
+                try:
+                    self.sock.close()
+                except:
+                    pass
+                if os.path.exists(self.sock_path):
+                    os.unlink(self.sock_path)
+
+        def _handle_client(self, client):
             try:
                 # 读取请求行
                 request_line = b""
@@ -779,7 +779,7 @@ def create_unix_socket_app(app, sock_path):
 
                 # 调用 WSGI 应用
                 from werkzeug.wrappers import Response
-                resp = Response.from_app(app, environ)
+                resp = Response.from_app(self.app, environ)
 
                 # 发送响应
                 status_line = f"HTTP/1.1 {resp.status_code} {resp.status}\r\n"
