@@ -718,30 +718,42 @@ class UnixSocketServer:
             if not request_line:
                 return
 
+            # 去除 \r\n
+            request_line = request_line.rstrip(b"\r\n")
+            
             # 解析请求
             parts = request_line.decode("utf-8", errors="replace").split()
             if len(parts) < 2:
+                log(f"Invalid request line: {request_line}")
                 return
 
             method, path, version = parts[0], parts[1], parts[2] if len(parts) > 2 else "HTTP/1.1"
+            log(f"Request: {method} {path} {version}")
 
             # 读取请求头
             headers = {}
             body = b""
+            
             while True:
+                # 读取一行
                 line = b""
                 while b"\r\n" not in line:
                     chunk = client.recv(4096)
                     if not chunk:
                         return
                     line += chunk
+                    # 防止无限循环，如果收到了数据但没有 \r\n，继续读取
+                    if len(line) > 4096:
+                        return
 
-                if not line or line == b"\r\n":
+                # 检查是否是空行（请求头结束）
+                if line in (b"\r\n", b"", b"\n"):
                     break
 
-                line = line.decode("utf-8", errors="replace").strip()
-                if ":" in line:
-                    key, value = line.split(":", 1)
+                # 解析请求头
+                line_str = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if ":" in line_str:
+                    key, value = line_str.split(":", 1)
                     headers[key.strip()] = value.strip()
 
             # 读取请求体
