@@ -1,0 +1,165 @@
+#!/bin/bash
+###############################################################################
+# PDF 阅读器 — cmd/main
+# 启停/状态管理纯原生 Python PDF 服务（统一网关 Unix socket 模式）
+# 服务端为 PyInstaller 编译后的独立二进制，无需 Python 解释器
+###############################################################################
+
+SERVER="${TRIM_APPDEST}/server/pdfserver"
+SOCK_PATH="${TRIM_APPDEST}/app.sock"          # 必须与 app/ui/config 的 gatewaySocket 一致
+PID_FILE="${TRIM_PKGVAR}/pdfreader.pid"
+LOG_FILE="${TRIM_PKGVAR}/pdfreader.log"
+
+# 网关前缀须与 app/ui/config 的 gatewayPrefix 完全一致： "/app/" + appname(点换连字符)
+export PDFR_GATEWAY_PREFIX="/app/fnnas-pdfreader"
+export PDFR_APPNAME="pdfreader"
+export PDFR_SOCK="${SOCK_PATH}"
+export PDFR_WEBROOT="${TRIM_APPDEST}/ui"
+export PDFR_LOGFILE="${LOG_FILE}"             # 服务自写日志（不依赖 shell 重定向）
+export PDFR_REQUIRE_AUTH="1"                  # 生产环境强制校验网关注入的 X-Trim-* 头
+
+# 阅读进度 / 书签 / 元数据 的持久化根目录（NAS 上的 var 目录，应用专属、卸载默认保留）
+export PDFR_DATA_DIR="${TRIM_PKGVAR}/data"
+
+# PDF 书库目录：优先 data-share（PDFLibrary），并叠加用户在应用设置里授权的目录
+# TRIM_DATA_SHARE_PATHS 与 TRIM_DATA_ACCESSIBLE_PATHS 均以 ':' 分隔
+export PDFR_SHARE_PATHS="${TRIM_DATA_SHARE_PATHS}"
+export PDFR_ACCESSIBLE_PATHS="${TRIM_DATA_ACCESSIBLE_PATHS}"
+
+# 动态根目录文件：服务每次扫描时重读该文件，因此用户在“应用设置”里增删授权目录后，
+# 由 config_callback 重写此文件 + 重启服务即可立即生效。
+export PDFR_ROOTS_FILE="${TRIM_PKGVAR}/roots.txt"
+
+# 把当前 data-share + 授权目录写入 roots 文件（每行一个路径，按 ':' 拆分）
+write_roots_file() {
+    mkdir -p "${TRIM_PKGVAR}" 2>/dev/null
+    {
+        printf "%s\n" "${TRIM_DATA_SHARE_PATHS}" | tr ':' '\n'
+        printf "%s\n" "${TRIM_DATA_ACCESSIBLE_PATHS}" | tr ':' '\n'
+    } | sed '/^$/d' > "${PDFR_ROOTS_FILE}.tmp" 2>/dev/null
+    mv -f "${PDFR_ROOTS_FILE}.tmp" "${PDFR_ROOTS_FILE}" 2>/dev/null
+}
+
+# 安全：仅允许网关进程(nginx worker，通常 www-data)与本服务用户/root 直连 socket
+export PDFR_PEERCRED_CHECK="1"
+_wwwuid="$(id -u www-data 2>/dev/null)"
+if [ -n "${_wwwuid}" ]; then
+    export PDFR_ALLOW_UIDS="0,${_wwwuid}"
+else
+    export PDFR_ALLOW_UIDS="0"
+fi
+
+log_msg() { mkdir -p "${TRIM_PKGVAR}" 2>/dev/null; echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"; }
+
+check_process() { kill -0 "$1" 2>/dev/null; }
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(head -n1 "${PID_FILE}" | tr -d '[:space:]')
+        if [ -n "${pid}" ] && check_process "${pid}"; then
+            return 0
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    return 1
+}
+
+start_process() {
+    mkdir -p "${TRIM_PKGVAR}" "${PDFR_DATA_DIR}" 2>/dev/null
+    write_roots_file
+    log_msg "=== start invoked ==="
+    log_msg "APPDEST=${TRIM_APPDEST} (real: $(readlink -f "${TRIM_APPDEST}" 2>/dev/null))"
+    log_msg "PKGVAR=${TRIM_PKGVAR}  RUN_USER=${TRIM_RUN_USERNAME}  APP_USER=${TRIM_USERNAME}"
+    log_msg "SHARE_PATHS=${PDFR_SHARE_PATHS}"
+    log_msg "ACCESSIBLE_PATHS=${PDFR_ACCESSIBLE_PATHS}"
+    log_msg "ROOTS_FILE=${PDFR_ROOTS_FILE} ->"
+    [ -f "${PDFR_ROOTS_FILE}" ] && while IFS= read -r _r; do log_msg "  root: ${_r}"; done < "${PDFR_ROOTS_FILE}"
+    if touch "${TRIM_APPDEST}/.wtest" 2>/dev/null; then
+        rm -f "${TRIM_APPDEST}/.wtest"
+        log_msg "target writable: YES"
+    else
+        log_msg "target writable: NO (无法在 target 创建 socket，将导致启动失败)"
+    fi
+
+    if status; then
+        log_msg "already running"
+        return 0
+    fi
+
+    if [ ! -f "${SERVER}" ]; then
+        echo "PDF 服务二进制文件缺失：${SERVER}，启动失败。" > "${TRIM_TEMP_LOGFILE}"
+        log_msg "server missing: ${SERVER}"
+        return 1
+    fi
+    if [ ! -x "${SERVER}" ]; then
+        chmod +x "${SERVER}" || {
+            echo "PDF 服务二进制文件不可执行且无法 chmod：${SERVER}，启动失败。" > "${TRIM_TEMP_LOGFILE}"
+            log_msg "server not executable and chmod failed: ${SERVER}"
+            return 1
+        }
+    fi
+    # 诊断：确认二进制格式
+    _magic="$(xxd -l 4 "${SERVER}" 2>/dev/null | head -1 | tr -d ':' | awk '{print $2 $3 $4 $5}' | tr 'a-f' 'A-F')"
+    case "${_magic}" in
+        7F454C46) log_msg "server binary format: ELF (Linux) OK" ;;
+        CFFAEDFE|FEEDFACE|FEEDFACF) log_msg "WARN: server binary format: Mach-O (macOS) — will not run on Linux NAS!" ;;
+        *) log_msg "WARN: server binary format unknown (magic=${_magic})" ;;
+    esac
+    log_msg "using server binary: ${SERVER}"
+
+    rm -f "${SOCK_PATH}"
+
+    log_msg "starting pdfreader: ${SERVER}"
+    nohup "${SERVER}" >> "${LOG_FILE}" 2>&1 &
+    # 不用 eval/sh -c，直接执行；若仍报 Syntax error，说明二进制格式不对（macOS Mach-O 在 Linux 上无法运行）
+    pid=$!
+    printf "%s" "${pid}" > "${PID_FILE}"
+
+    # 等待 socket 就绪（最多 5 秒）
+    c=0
+    while [ ! -S "${SOCK_PATH}" ] && [ ${c} -lt 25 ]; do
+        check_process "${pid}" || break
+        sleep 0.2
+        c=$((c+1))
+    done
+
+    if check_process "${pid}" && [ -S "${SOCK_PATH}" ]; then
+        log_msg "started pid=${pid}"
+        return 0
+    fi
+
+    echo "PDF 阅读器服务启动失败，请查看日志：${LOG_FILE}" > "${TRIM_TEMP_LOGFILE}"
+    log_msg "start failed; recent log:"
+    tail -n 20 "${LOG_FILE}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    rm -f "${PID_FILE}"
+    return 1
+}
+
+stop_process() {
+    if [ ! -r "${PID_FILE}" ]; then
+        rm -f "${SOCK_PATH}"
+        return 0
+    fi
+    pid=$(head -n1 "${PID_FILE}" | tr -d '[:space:]')
+    if [ -z "${pid}" ] || ! check_process "${pid}"; then
+        rm -f "${PID_FILE}" "${SOCK_PATH}"
+        return 0
+    fi
+    log_msg "stopping pid=${pid}"
+    kill -TERM "${pid}" 2>/dev/null
+    c=0
+    while check_process "${pid}" && [ ${c} -lt 10 ]; do
+        sleep 1; c=$((c+1))
+    done
+    check_process "${pid}" && kill -KILL "${pid}" 2>/dev/null
+    rm -f "${PID_FILE}" "${SOCK_PATH}"
+    log_msg "stopped"
+    return 0
+}
+
+case "$1" in
+    start)  start_process; exit $? ;;
+    stop)   stop_process;  exit 0 ;;
+    status) status && exit 0 || exit 3 ;;
+    *)      echo "usage: $0 {start|stop|status}"; exit 1 ;;
+esac

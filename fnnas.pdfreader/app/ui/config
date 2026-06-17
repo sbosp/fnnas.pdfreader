@@ -1,0 +1,17 @@
+{
+    ".url": {
+        "fnnas.pdfreader.Application": {
+            "title": "PDF 阅读器",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "url": "/app/fnnas-pdfreader/",
+            "allUsers": true,
+            "gatewaySocket": "app.sock",
+            "gatewayPrefix": "/app/fnnas-pdfreader",
+            "control": {
+                "accessPerm": "readonly"
+            }
+        }
+    }
+}

@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+pyservice/__pycache__/
+pyservice/*.pyc
+pyservice/*.pyo
+
+# Build outputs
+vueapp/dist/
+pyservice/dist/
+pyservice/build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# fnOS local data
+fnnas.pdfreader/data/
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# PyInstaller
+pyservice/*.spec

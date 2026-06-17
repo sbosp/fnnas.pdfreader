@@ -1,0 +1,36 @@
+@import './base.css';
+
+#app {
+    width: 100%; /* 全屏宽度 */
+    /*max-width: 1880px; !* 最大不超过480px（手机端标准） *!*/
+    margin: 0 auto;
+    /*padding: 16px; !* 用px固定内边距，更稳定 *!*/
+    font-weight: normal;
+    box-sizing: border-box; /* 必须加，防止宽度溢出 */
+}
+
+a,
+.green {
+    text-decoration: none;
+    color: hsla(160, 100%, 37%, 1);
+    transition: 0.4s;
+    padding: 3px;
+}
+
+@media (hover: hover) {
+    a:hover {
+        background-color: hsla(160, 100%, 37%, 0.2);
+    }
+}
+
+@media (min-width: 424px) {
+    body {
+        display: flex;
+        place-items: center;
+    }
+
+    #app {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+    }
+}

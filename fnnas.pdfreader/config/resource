@@ -1,0 +1,12 @@
+{
+    "data-share": {
+        "shares": [
+            {
+                "name": "PDFLibrary",
+                "permission": {
+                    "rw": ["fnnas.pdfreader"]
+                }
+            }
+        ]
+    }
+}
