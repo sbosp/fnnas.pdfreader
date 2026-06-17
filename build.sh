@@ -102,19 +102,12 @@ echo -e "${YELLOW}[Install] 安装到 fnOS...${NC}"
 
 cd "$FNOS_APP_DIR"
 
-fnpack build
+#fnpack build
+#
+#appcenter-cli install-fpk fnnas.pdfreader.fpk
 
-appcenter-cli install-fpk fnnas.pdfreader.fpk
-
-#if command -v appcenter-cli &> /dev/null; then
-#    echo "执行 appcenter-cli install-local..."
-#    appcenter-cli install-local
-#else
-#    echo -e "${RED}错误: appcenter-cli 未安装${NC}"
-#    echo "请先安装 appcenter-cli 或手动执行:"
-#    echo "  cd $FNOS_APP_DIR"
-#    echo "  appcenter-cli install-local"
-#fi
+echo "执行 appcenter-cli install-local..."
+appcenter-cli install-local
 
 echo ""
 echo -e "${GREEN}=== 编译完成 ===${NC}"
