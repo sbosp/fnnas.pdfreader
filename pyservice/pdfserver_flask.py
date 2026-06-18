@@ -645,21 +645,6 @@ def main():
         log(f"Using TCP debug mode on {args.host}:{args.port}")
         app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
     else:
-        # from gevent.pywsgi import WSGIServer
-        # import gevent.socket
-        # sock_path = SOCK_PATH
-        # if os.path.exists(sock_path):
-        #     os.unlink(sock_path)
-        # server = WSGIServer(
-        #     gevent.socket.Address(sock_path, family=gevent.socket.AF_UNIX),
-        #     app,
-        #     spawn=6,
-        #     timeout=180
-        # )
-        # os.chmod(sock_path, 0o666)
-        # log(f"gevent WSGI listen {sock_path}")
-        # server.serve_forever()
-
         from waitress import serve
         import stat
         sock_file = SOCK_PATH
@@ -671,7 +656,7 @@ def main():
         serve(
             app,
             unix_socket=sock_file,
-            threads=6,
+            threads=16,
             connection_limit=128,
             channel_timeout=180,  # 单次请求最大180秒，解决PDF扫描渲染超时
             cleanup_interval=10
@@ -683,20 +668,6 @@ def main():
             stat.S_IRGRP | stat.S_IWGRP |
             stat.S_IROTH | stat.S_IWOTH
         )
-        #
-        # import uvicorn
-        # sock = SOCK_PATH
-        # if os.path.exists(sock):
-        #     os.unlink(sock)
-        # uvicorn.run(
-        #     "pdfserver_flask:app",
-        #     uds=sock,
-        #     workers=2,
-        #     limit_concurrency=128,
-        #     timeout_keep_alive=180,
-        #     log_level="info"
-        # )
-        # os.chmod(sock, 0o666)
 
 
 if __name__ == "__main__":
