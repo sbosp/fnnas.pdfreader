@@ -628,216 +628,6 @@ def serve_static(filename):
 
     return "PDF 阅读器：资源未找到", 404
 
-
-# ----------------------------------------------------------------------------
-# 启动
-# ----------------------------------------------------------------------------
-class UnixSocketServer(socketserver.UnixStreamServer):
-    """基于 Unix Socket 的 WSGI 服务器"""
-    request_queue_size = 128
-    allow_reuse_address = False
-
-    def server_bind(self):
-        if os.path.exists(self.server_address):
-            os.unlink(self.server_address)
-        super().server_bind()
-
-    def get_request(self):
-        # 返回 socket 和地址，兼容 WSGI
-        sock, addr = super().get_request()
-        return sock, addr
-
-
-class UnixSocketServer:
-    """基于 Unix Socket 的 WSGI 服务器"""
-    
-    def __init__(self, app, sock_path):
-        self.app = app
-        self.sock_path = sock_path
-        self.sock = None
-        self.running = False
-        self.server = None
-
-    def serve_forever(self):
-        # 清理旧的 socket 文件
-        if os.path.exists(self.sock_path):
-            os.unlink(self.sock_path)
-
-        # 创建 Unix Socket
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.bind(self.sock_path)
-        self.sock.listen(128)
-        self.sock.settimeout(0.5)
-
-        # 设置 socket 文件权限为 0666，让 fnOS 网关 nginx worker 可以访问
-        try:
-            os.chmod(self.sock_path, 0o666)
-        except OSError:
-            pass
-
-        self.running = True
-        log(f"Unix Socket listening on {self.sock_path}")
-
-        # 主循环
-        while self.running:
-            try:
-                client, addr = self.sock.accept()
-                # 在新线程中处理请求
-                t = threading.Thread(
-                    target=self._handle_client,
-                    args=(client,),
-                    daemon=True
-                )
-                t.start()
-            except socket.timeout:
-                continue
-            except OSError as e:
-                if "Interrupted system call" not in str(e):
-                    break
-
-    def shutdown(self):
-        self.running = False
-        if self.sock:
-            try:
-                self.sock.close()
-            except:
-                pass
-            if os.path.exists(self.sock_path):
-                os.unlink(self.sock_path)
-
-    def _handle_client(self, client):
-        try:
-            # 读取请求行（可能包含 HAProxy Protocol v1/v2 前缀）
-            request_line = b""
-            while b"\r\n" not in request_line:
-                chunk = client.recv(4096)
-                if not chunk:
-                    return
-                request_line += chunk
-
-            if not request_line:
-                return
-
-            # 去除 \r\n
-            request_line = request_line.rstrip(b"\r\n")
-            
-            # 检查是否是 HAProxy Protocol v1 (PROXY TCP4/6...)
-            if request_line.startswith(b"PROXY "):
-                # 解析 PROXY 协议，获取真实客户端信息
-                proxy_parts = request_line.decode("utf-8", errors="replace").split()
-                if len(proxy_parts) >= 6:
-                    log(f"HAProxy Protocol: {proxy_parts[1]} {proxy_parts[2]}:{proxy_parts[4]} -> {proxy_parts[3]}:{proxy_parts[5]}")
-                # 继续读取真正的 HTTP 请求行
-                request_line = b""
-                while b"\r\n" not in request_line:
-                    chunk = client.recv(4096)
-                    if not chunk:
-                        return
-                    request_line += chunk
-                if not request_line:
-                    return
-                request_line = request_line.rstrip(b"\r\n")
-
-            # 解析请求
-            parts = request_line.decode("utf-8", errors="replace").split()
-            if len(parts) < 2:
-                log(f"Invalid request line: {request_line}")
-                return
-
-            method, path, version = parts[0], parts[1], parts[2] if len(parts) > 2 else "HTTP/1.1"
-            log(f"Request: {method} {path} {version}")
-
-            # 读取请求头
-            headers = {}
-            body = b""
-            
-            while True:
-                # 读取一行
-                line = b""
-                while b"\r\n" not in line:
-                    chunk = client.recv(4096)
-                    if not chunk:
-                        return
-                    line += chunk
-                    # 防止无限循环，如果收到了数据但没有 \r\n，继续读取
-                    if len(line) > 4096:
-                        return
-
-                # 检查是否是空行（请求头结束）
-                if line in (b"\r\n", b"", b"\n"):
-                    break
-
-                # 解析请求头
-                line_str = line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if ":" in line_str:
-                    key, value = line_str.split(":", 1)
-                    headers[key.strip()] = value.strip()
-
-            # 读取请求体
-            content_length = int(headers.get("Content-Length", 0))
-            if content_length > 0:
-                body = b""
-                while len(body) < content_length:
-                    chunk = client.recv(min(4096, content_length - len(body)))
-                    if not chunk:
-                        break
-                    body += chunk
-
-            # 构建 WSGI environ
-            environ = {
-                "REQUEST_METHOD": method,
-                "PATH_INFO": path.split("?")[0],
-                "QUERY_STRING": path.split("?")[1] if "?" in path else "",
-                "SERVER_PROTOCOL": version,
-                "SERVER_NAME": "fnOS",
-                "SERVER_PORT": "80",
-                "wsgi.version": (1, 0),
-                "wsgi.input": io.BytesIO(body),
-                "wsgi.errors": sys.stderr,
-                "wsgi.multithread": True,
-                "wsgi.multiprocess": False,
-                "wsgi.run_once": False,
-                "wsgi.url_scheme": "http",
-                "CONTENT_LENGTH": str(len(body)),
-                "CONTENT_TYPE": headers.get("Content-Type", ""),
-            }
-
-            # 添加所有请求头
-            for key, value in headers.items():
-                environ["HTTP_%s" % key.upper().replace("-", "_")] = value
-
-            # 调用 WSGI 应用
-            from werkzeug.wrappers import Response
-            resp = Response.from_app(self.app, environ)
-
-            # 发送响应
-            status_line = f"HTTP/1.1 {resp.status_code} {resp.status}\r\n"
-            client.send(status_line.encode())
-
-            for key, value in resp.headers:
-                client.send(f"{key}: {value}\r\n".encode())
-            client.send(b"\r\n")
-
-            # 发送响应体
-            for chunk in resp.response:
-                if isinstance(chunk, str):
-                    chunk = chunk.encode()
-                client.send(chunk)
-
-            client.close()
-
-        except Exception as e:
-            log(f"handle_client error: {e}")
-            try:
-                client.close()
-            except:
-                pass
-
-def create_unix_socket_app(app, sock_path):
-    """创建基于 Unix Socket 的 Flask 应用服务器"""
-    return UnixSocketServer(app, sock_path)
-
-
 def main():
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -850,29 +640,71 @@ def main():
     log(f"prefix={GATEWAY_PREFIX}")
     log(f"sock_path={SOCK_PATH}")
 
-    # 优先使用 Unix Socket（fnOS 统一网关），否则使用 TCP
+    # 仅保留本地TCP调试模式
     if args.port > 0:
-        # TCP 模式（本地调试）
-        log(f"Using TCP mode on {args.host}:{args.port}")
+        log(f"Using TCP debug mode on {args.host}:{args.port}")
         app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
     else:
-        # Unix Socket 模式（fnOS 统一网关）
-        log(f"Using Unix Socket mode on {SOCK_PATH}")
-        server = create_unix_socket_app(app, SOCK_PATH)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            log("Shutting down...")
-            server.shutdown()
+        # from gevent.pywsgi import WSGIServer
+        # import gevent.socket
+        # sock_path = SOCK_PATH
+        # if os.path.exists(sock_path):
+        #     os.unlink(sock_path)
+        # server = WSGIServer(
+        #     gevent.socket.Address(sock_path, family=gevent.socket.AF_UNIX),
+        #     app,
+        #     spawn=6,
+        #     timeout=180
+        # )
+        # os.chmod(sock_path, 0o666)
+        # log(f"gevent WSGI listen {sock_path}")
+        # server.serve_forever()
+
+        from waitress import serve
+        import stat
+        sock_file = SOCK_PATH
+        # 清理残留socket文件
+        if os.path.exists(sock_file):
+            os.unlink(sock_file)
+        log(f"Waitress WSGI listening unix socket: {sock_file}")
+        # 启动WSGI服务，原生支持Unix Socket，自带超时防504
+        serve(
+            app,
+            unix_socket=sock_file,
+            threads=6,
+            connection_limit=128,
+            channel_timeout=180,  # 单次请求最大180秒，解决PDF扫描渲染超时
+            cleanup_interval=10
+        )
+        # 设置socket权限0666，nginx网关可读写
+        os.chmod(
+            sock_file,
+            stat.S_IRUSR | stat.S_IWUSR |
+            stat.S_IRGRP | stat.S_IWGRP |
+            stat.S_IROTH | stat.S_IWOTH
+        )
+        #
+        # import uvicorn
+        # sock = SOCK_PATH
+        # if os.path.exists(sock):
+        #     os.unlink(sock)
+        # uvicorn.run(
+        #     "pdfserver_flask:app",
+        #     uds=sock,
+        #     workers=2,
+        #     limit_concurrency=128,
+        #     timeout_keep_alive=180,
+        #     log_level="info"
+        # )
+        # os.chmod(sock, 0o666)
 
 
 if __name__ == "__main__":
     try:
-        mode = "TCP" if args.port > 0 else "Unix Socket"
+        mode = "TCP Debug" if args.port > 0 else "Production(use gunicorn)"
         log(f"=== pdfreader flask server boot === mode={mode} prefix={GATEWAY_PREFIX} py={sys.version.split()[0]}")
         main()
     except Exception:
         import traceback
-
         log("FATAL boot error:\n" + traceback.format_exc())
         raise
