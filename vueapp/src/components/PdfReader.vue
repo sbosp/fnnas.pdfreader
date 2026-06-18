@@ -30,25 +30,14 @@ import PdfViewer from '@/components/PdfViewer.vue'
 import type {PdfPageData} from '@/composables/DataBean'
 import request from '@/utils/request'
 import {throttle, debounce} from '@/utils/UIUtils'
+// 替换原来的 import * as pdfjsLib from 'pdfjs-dist'
+// 注意后缀是 .mjs 不是 .js
+// @ts-ignore - legacy 版本无官方类型声明，运行时功能完全正常
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.min.mjs'
 
-if (typeof (Promise as any).withResolvers !== 'function') {
-  (Promise as any).withResolvers = function <T>() {
-    let resolve!: (value: T | PromiseLike<T>) => void
-    let reject!: (reason?: any) => void
-    const promise = new Promise<T>((res, rej) => {
-      resolve = res
-      reject = rej
-    })
-    return { promise, resolve, reject }
-  }
-}
-
-import * as pdfjsLib from 'pdfjs-dist'
-
-// Vite 原生标准写法，无需 ?url
-const workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href
+// Worker 也必须换成 legacy 版本（关键！否则 Worker 线程还是会报错）
+const workerSrc = new URL('pdfjs-dist/legacy/build/pdf.worker.min.mjs', import.meta.url).href
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc
-
 const route = useRoute()
 const router = useRouter()
 const viewerRef = ref<InstanceType<typeof PdfViewer>>()
