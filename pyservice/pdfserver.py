@@ -398,6 +398,7 @@ def api_books():
     query_path = request.args.get('path', '')
     query_scan = request.args.get('scan', '')
     uid = user["uid"]
+    username = user["username"]
 
     start = time.time()
     file_map = load_file_map(uid)
@@ -432,7 +433,7 @@ def api_books():
             }
             history.append(tmp_b)
     history.sort(key=lambda x: x["progress"].get("updatedAt", 0), reverse=True)
-    return jsonify({"books": books, "history": history, "count": len(books)})
+    return jsonify({"books": books, "history": history, "count": len(books), "username": username})
 
 
 @app.route(f"{GATEWAY_PREFIX}/api/meta", methods=["GET"])
@@ -513,7 +514,7 @@ def render_page(entry, page: int, dpi: int):
 
     # 检查缓存
     exists = os.path.exists(path)
-    if exists and False:
+    if exists:
         try:
             with open(path, "rb") as f:
                 cached_data = f.read()
@@ -604,21 +605,12 @@ def api_page():
     if res is None:
         abort(404, "page out of range")
 
-    # base64_data = base64.b64encode(res).decode('utf-8')
-    # return jsonify({
-    #     "success": True,
-    #     "base64": f"data:image/png;base64,{base64_data}",
-    #     "mimeType": "image/png",
-    #     "size": len(res),
-    #     "page": page,
-    #     "dpi": dpi
-    # })
     # 直接返回二进制图片数据
     return send_file(
         io.BytesIO(res),
         mimetype="image/png",
         as_attachment=False,
-        max_age=86400  # 缓存24小时
+        max_age=86400 * 3  # 缓存 24 * 3 小时
     )
 
 

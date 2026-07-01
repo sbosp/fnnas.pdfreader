@@ -398,17 +398,55 @@ function scrollToPage(pageNum: number) {
 }
 
 // ============ 缩放 ============
+// 缩放时保持当前页在视口位置：记录中心页的相对位置，缩放后滚动到相同位置
+function applyZoom(newIdx: number) {
+  const vp = viewportRef.value
+  if (!vp) {
+    zoomIdx.value = newIdx
+    recomputeAllSizes()
+    return
+  }
+
+  // 记录当前视口中心相对于当前页顶部的比例
+  const scrollTop = vp.scrollTop
+  const viewCenter = scrollTop + vp.clientHeight / 2
+  let acc = 0
+  let anchorPage = 0
+  let anchorRatio = 0
+  for (let i = 0; i < pages.length; i++) {
+    const h = pages[i].displayHeight + 20
+    if (viewCenter >= acc && viewCenter < acc + h) {
+      anchorPage = i
+      anchorRatio = (viewCenter - acc) / h
+      break
+    }
+    acc += h
+  }
+
+  // 应用新缩放（只改显示尺寸，不重设 img.src，浏览器不会重新请求）
+  zoomIdx.value = newIdx
+  recomputeAllSizes()
+
+  // 恢复到原来的相对位置
+  nextTick(() => {
+    let top = 0
+    for (let i = 0; i < anchorPage && i < pages.length; i++) {
+      top += pages[i].displayHeight + 20
+    }
+    top += (pages[anchorPage]?.displayHeight || 0) * anchorRatio
+    vp.scrollTop = top - vp.clientHeight / 2
+  })
+}
+
 function zoomIn() {
   if (zoomIdx.value < zoomLevels.length - 1) {
-    zoomIdx.value++
-    recomputeAllSizes()
+    applyZoom(zoomIdx.value + 1)
   }
 }
 
 function zoomOut() {
   if (zoomIdx.value > 0) {
-    zoomIdx.value--
-    recomputeAllSizes()
+    applyZoom(zoomIdx.value - 1)
   }
 }
 

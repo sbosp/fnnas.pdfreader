@@ -13,6 +13,32 @@ const route = useRoute()
 const refreshing = ref(false)
 const allBooks = ref([])
 const recentBooks = ref([])
+const username = ref('')
+
+// 连续点击「用户」5 次后启用 vconsole
+const userClickCount = ref(0)
+let userClickTimer = null
+const onUserClick = () => {
+  userClickCount.value++
+  if (userClickTimer) clearTimeout(userClickTimer)
+  // 2 秒内未继续点击则重置
+  userClickTimer = setTimeout(() => {
+    userClickCount.value = 0
+  }, 2000)
+
+  if (userClickCount.value >= 5) {
+    userClickCount.value = 0
+    if (userClickTimer) {
+      clearTimeout(userClickTimer)
+      userClickTimer = null
+    }
+    if (typeof window.__enableVConsole === 'function') {
+      Promise.resolve(window.__enableVConsole()).then(() => {
+        console.log('✅ vConsole 已启用')
+      })
+    }
+  }
+}
 
 watch(
     () => route.params,
@@ -49,6 +75,7 @@ const refreshPage = (scan = "", path = '') => {
   request.get(`books?path=${path}&scan=${scan}`).then((data) => {
     allBooks.value = data.data.books || []
     recentBooks.value = data.data.history || []
+    username.value = data.data.username || '用户'
   }).catch((err) => {
     console.error('❌ books请求失败:', {
       message: err.message,
@@ -127,7 +154,7 @@ onMounted(() => {
     </span>
     <div class="spacer"></div>
     <button class="btn icon" @click="refreshClick" title="刷新书库">⟳ 刷新</button>
-    <span class="user">👤 用户</span>
+    <span class="user" @click="onUserClick">👤 {{ username}}</span>
   </div>
 
   <!-- 书架内容 -->
@@ -225,6 +252,8 @@ onMounted(() => {
 .topbar .user {
   font-size: 13px;
   color: var(--sub);
+  cursor: pointer;
+  user-select: none;
 }
 
 .btn {
