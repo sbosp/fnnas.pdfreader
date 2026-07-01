@@ -79,37 +79,17 @@ python -m pip install --upgrade pip setuptools wheel -i https://pypi.tuna.tsingh
 python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # 执行 PyInstaller 打包
-echo "执行 pyinstaller..."
-pyinstaller -F -w --optimize 2 --noconfirm pdfserver.py
+echo "运行 测试..."
 
-# 检查编译结果
-if [ ! -f "dist/pdfserver" ]; then
-    echo -e "${RED}错误: PyInstaller 编译失败${NC}"
-    exit 1
+# 优雅地终止5173端口进程（如果存在）
+echo "检查5173端口占用情况..."
+if lsof -ti:5173 >/dev/null 2>&1; then
+    echo "发现占用5173端口的进程，正在终止..."
+    kill -9 $(lsof -ti:5173) 2>/dev/null || true
+    sleep 1
+    echo "端口清理完成"
+else
+    echo "5173端口未被占用"
 fi
 
-# 复制到 fnos 应用目录
-SERVER_DIR="$FNOS_APP_DIR/app/server"
-mkdir -p "$SERVER_DIR"
-
-# 复制可执行文件并重命名
-cp -f dist/pdfserver "$SERVER_DIR/pdfserver"
-
-echo -e "${GREEN}Python 服务端编译完成${NC}"
-
-# 安装到 fnOS
-echo ""
-echo -e "${YELLOW}[Install] 安装到 fnOS...${NC}"
-
-cd "$FNOS_APP_DIR"
-
-fnpack build
-#
-#appcenter-cli install-fpk fnnas.pdfreader.fpk
-
-#echo "执行 appcenter-cli install-local..."
-#appcenter-cli install-local
-
-echo ""
-echo -e "${GREEN}=== 编译完成 ===${NC}"
-echo "应用目录: $FNOS_APP_DIR"
+python3 test_flask.py

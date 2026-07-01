@@ -2,3 +2,4 @@ pymupdf
 flask
 pyinstaller
 waitress
+pillow

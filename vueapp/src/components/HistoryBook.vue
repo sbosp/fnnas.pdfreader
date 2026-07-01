@@ -1,6 +1,6 @@
 <template>
   <div class="rcover">
-    <div v-show="coverBase64.length <= 0" class="rph">
+    <div class="rph">
       <svg viewBox="0 0 24 24" fill="none">
         <path d="M6 2h8l4 4v16H6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
         <path d="M14 2v4h4" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
@@ -8,8 +8,7 @@
     </div>
 
     <img
-        v-if="coverBase64.length > 0"
-        :src="coverBase64"
+        :src="`api/page?id=${encodeURIComponent(props.book.id)}&dpi=80`"
         loading="lazy"
     />
     <span class="rpage" v-if="book.progress?.page">
@@ -24,28 +23,17 @@
 </template>
 
 <script setup lang="ts">
-import {ref, computed} from 'vue'
-import request from '@/utils/request'
+import {ref} from 'vue'
 
 const props = defineProps<{
   book: any
 }>()
 
 const emit = defineEmits(['click'])
-const coverBase64 = ref('')
-
-function loadCoverBase64() {
-  request.get(`page?id=${encodeURIComponent(props.book.id)}`).then((res) => {
-    coverBase64.value = res.data.base64 || ''
-  })
-}
-
-loadCoverBase64()
 
 </script>
 
 <style scoped>
-
 
 .cover img {
   width: 100%;
@@ -130,10 +118,14 @@ loadCoverBase64()
   height: 100%;
   object-fit: cover;
   display: block;
+  position: absolute; /* 封面图：绝对定位 */
+  z-index: 2; /* 在上层 */
 }
 
 .ritem .rcover .rph {
   color: #b3bccb;
+  position: absolute; /* 封面图：绝对定位 */
+  z-index: 1; /* 在上层 */
 }
 
 .ritem .rcover .rph svg {
@@ -148,6 +140,7 @@ loadCoverBase64()
   bottom: 0;
   height: 3px;
   background: rgba(0, 0, 0, .12);
+  z-index: 3; /* 在上层 */
 }
 
 .ritem .rbar > i {
@@ -165,6 +158,7 @@ loadCoverBase64()
   font-size: 10px;
   padding: 1px 6px;
   border-radius: 999px;
+  z-index: 3; /* 在上层 */
 }
 
 .ritem .rname {

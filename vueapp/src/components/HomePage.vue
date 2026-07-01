@@ -1,7 +1,7 @@
 <script setup>
 import {ref, computed, onMounted, onUnmounted, watch} from 'vue'
 import {useRouter, useRoute} from 'vue-router'
-import request from '@/utils/request'
+import {request} from '@/utils/request.js'
 import Folder from '@/components/Folder.vue'
 import Book from '@/components/Book.vue'
 import HistoryBook from '@/components/HistoryBook.vue'
@@ -22,7 +22,7 @@ watch(
       // 对路由变化做出响应...
       console.log('路径发生变化，刷新页面数据', newParams.folderId)
       let folderId = newParams.folderId || ''
-      refreshPage(folderId === '' ? 'all' : '', folderId)
+      refreshPage('', folderId)
     }
 )
 
@@ -43,6 +43,9 @@ const currentLevel = computed(() => {
 
 const refreshPage = (scan = "", path = '') => {
   console.log('refreshPage 哦额份份额我怕', route.params)
+  if (path === '') {
+    path = route.params?.folderId || ''
+  }
   request.get(`books?path=${path}&scan=${scan}`).then((data) => {
     allBooks.value = data.data.books || []
     recentBooks.value = data.data.history || []
@@ -65,6 +68,7 @@ const refreshPage = (scan = "", path = '') => {
 
 const refreshClick = () => {
   router.replace('/')
+  console.log('refreshClick')
   refreshPage('all')
 }
 
@@ -105,7 +109,6 @@ onMounted(() => {
   onUnmounted(() => {
     unwatch()
   })
-
   refreshPage()
 })
 </script>
@@ -343,10 +346,6 @@ onMounted(() => {
   height: 100%;
   object-fit: cover;
   display: block;
-}
-
-.ritem .rcover .rph {
-  color: #b3bccb;
 }
 
 .ritem .rcover .rph svg {

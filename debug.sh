@@ -103,12 +103,8 @@ echo -e "${YELLOW}[Install] 安装到 fnOS...${NC}"
 
 cd "$FNOS_APP_DIR"
 
-fnpack build
-#
-#appcenter-cli install-fpk fnnas.pdfreader.fpk
-
-#echo "执行 appcenter-cli install-local..."
-#appcenter-cli install-local
+echo "执行 appcenter-cli install-local..."
+appcenter-cli install-local
 
 echo ""
 echo -e "${GREEN}=== 编译完成 ===${NC}"

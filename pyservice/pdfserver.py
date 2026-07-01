@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PDF 阅读器 — 纯原生后端服务 (fnOS 统一网关版)
+PDF 阅读器 — Flask 版本 (fnOS 统一网关版)
 
 设计要点：
-  * 监听 Unix Domain Socket（由 fnOS 统一网关转发，无需暴露端口）
-  * HTTP 静态文件服务（自动剥离网关前缀 /app/<appname>）
+  * Flask 应用，同时托管前端静态文件 + API 接口
+  * 开发和生产环境使用相同路径前缀 /app/fnnas-pdfreader/
   * 书库扫描：递归扫描 data-share(PDFLibrary) 与用户授权目录下的 *.pdf
-  * **服务端渲染（核心）**：用捆绑的 PyMuPDF(fitz) 在 NAS 上把指定页渲染成 PNG/WebP，
-    只把渲染好的图片返回给连接端。PDF 原文件**绝不下载到连接端**，且打开瞬时（只渲染当前页）。
+  * **服务端渲染（核心）**：用 PyMuPDF(fitz) 在 NAS 上把指定页渲染成 PDF 切片，
+    只把渲染好的切片返回给连接端。PDF 原文件**绝不下载到连接端**。
   * 阅读进度 / 书签：按飞牛账号(UID)持久化到 NAS 的 var 数据目录，多端共享续读
   * 读取统一网关注入的 X-Trim-* 头做鉴权
-  * SO_PEERCRED 校验对端进程，防止本地用户绕过网关直连
 
+启动方式：
+  开发环境：python pdfserver.py --port 5173
+  生产环境：由 fnOS 统一网关通过 Unix Socket 转发
 """
+import argparse
 import base64
 import hashlib
 import json
 import os
-import socket
-import socketserver
-import struct
 import sys
 import threading
 import time
-import urllib.parse
+from PIL import Image
+import io
+
+from flask import Flask, request, jsonify, send_from_directory, send_file, abort
 import pymupdf
 
 # ----------------------------------------------------------------------------
@@ -33,11 +36,17 @@ import pymupdf
 APPNAME = os.environ.get("PDFR_APPNAME", "pdfreader")
 GATEWAY_PREFIX = os.environ.get("PDFR_GATEWAY_PREFIX", "/app/fnnas-pdfreader").rstrip("/")
 SOCK_PATH = os.environ.get("PDFR_SOCK", os.path.join(os.getcwd(), "app.sock"))
-TCP_PORT = os.environ.get("PDFR_TCP_PORT")  # 仅本地调试用
 DATA_DIR = os.environ.get("PDFR_DATA_DIR", os.path.join(os.getcwd(), "data"))
-REQUIRE_AUTH = os.environ.get("PDFR_REQUIRE_AUTH", "1") == "1"
-PEERCRED_CHECK = os.environ.get("PDFR_PEERCRED_CHECK", "1") == "1"
+REQUIRE_AUTH = os.environ.get("PDFR_REQUIRE_AUTH", "0") == "1"  # 本地调试默认关闭
+PEERCRED_CHECK = os.environ.get("PDFR_PEERCRED_CHECK", "0") == "1"
 LOGFILE = os.environ.get("PDFR_LOGFILE", "")
+
+# 解析命令行参数
+parser = argparse.ArgumentParser(description="PDF Reader Flask Server")
+parser.add_argument("--port", "-p", type=int, default=0, help="TCP 端口（默认 0，由 fnOS 统一网关通过 Unix Socket 转发）")
+parser.add_argument("--host", "-H", type=str, default="0.0.0.0", help="TCP 监听地址（仅 --port > 0 时生效）")
+parser.add_argument("--debug", "-d", action="store_true", help="开启调试模式")
+args, unknown = parser.parse_known_args()
 
 
 def _collect_roots():
@@ -70,22 +79,19 @@ for _p in _allow_raw.split(","):
 
 
 def _resolve_webroot():
-    here = os.path.dirname(os.path.abspath(__file__))  # .../target/server
-    candidates = []
-    env = os.environ.get("PDFR_WEBROOT")
-    if env:
-        candidates.append(env)
-    candidates += [
+    """查找前端构建产物目录"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.environ.get("PDFR_WEBROOT"),
+        os.path.join(here, "..", "vueapp", "dist"),
         os.path.join(here, "..", "ui"),
         os.path.join(here, "ui"),
-        os.path.join(here, "..", "..", "ui"),
-        os.path.join(here, ".."),
     ]
     for c in candidates:
-        c = os.path.abspath(c)
-        if os.path.isfile(os.path.join(c, "index.html")):
-            return c
-    return os.path.abspath(env) if env else os.path.abspath(os.path.join(here, "..", "ui"))
+        if c and os.path.isfile(os.path.join(c, "index.html")):
+            return os.path.abspath(c)
+    # 没找到构建产物，返回 vueapp/dist
+    return os.path.abspath(os.path.join(here, "..", "vueapp", "dist"))
 
 
 WEB_ROOT = _resolve_webroot()
@@ -126,11 +132,17 @@ def log(msg):
 
 
 # ----------------------------------------------------------------------------
-# 工具
+# Flask 应用
+# ----------------------------------------------------------------------------
+app = Flask(__name__, static_folder=WEB_ROOT, static_url_path=f"{GATEWAY_PREFIX}")
+
+
+# ----------------------------------------------------------------------------
+# 工具函数
 # ----------------------------------------------------------------------------
 def strip_prefix(path):
+    """剥离网关前缀"""
     path = path.split("?", 1)[0]
-    # 兼容请求行为绝对 URI（经代理时可能出现 GET http://host/path）的情况
     if path.startswith("http://") or path.startswith("https://"):
         rest = path.split("://", 1)[1]
         slash = rest.find("/")
@@ -143,7 +155,7 @@ def strip_prefix(path):
 
 
 def safe_join(root, rel):
-    """静态资源防目录穿透。"""
+    """静态资源防目录穿透"""
     rel = rel.lstrip("/")
     full = os.path.abspath(os.path.join(root, rel))
     if full != root and not full.startswith(root + os.sep):
@@ -155,22 +167,35 @@ def safe_join(root, rel):
 
 
 def hash_id_for(abspath):
-    """基于绝对路径生成稳定 bookId（重启后不变、跨用户一致）。"""
+    """基于绝对路径生成稳定 bookId"""
     return hashlib.sha1(abspath.encode("utf-8")).hexdigest()[:16]
 
 
+def get_user_from_request():
+    """从请求头获取用户信息"""
+    headers = request.headers
+    uid = headers.get("X-Trim-Userid")
+    is_admin = headers.get("X-Trim-Isadmin") == "true"
+    username = headers.get("X-Trim-Username")
+    if REQUIRE_AUTH and not uid:
+        return None
+    if not uid:
+        uid = "debug"
+    return {"uid": uid, "isAdmin": is_admin, "username": username or uid}
+
+
+# ----------------------------------------------------------------------------
+# 书库扫描
+# ----------------------------------------------------------------------------
 def scan_all(uid: str):
-    """递归扫描所有书库根目录下的 *.pdf，刷新全局索引并返回书目列表。
-    每次扫描都重新读取根目录列表，以支持运行期（应用设置中）授权目录的增删。"""
+    """递归扫描所有书库根目录下的 *.pdf"""
     global LIBRARY_ROOTS
     roots = _collect_roots()
     LIBRARY_ROOTS = roots
 
-    # 文件映射map key为文件或者文件夹的真实路径hash值
     file_map = {}
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
-            # 跳过隐藏目录
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             for fn in filenames:
                 if not fn.lower().endswith(".pdf"):
@@ -180,7 +205,6 @@ def scan_all(uid: str):
 
                 full = os.path.join(dirpath, fn)
                 real = os.path.realpath(full)
-                # 必须仍在某个 root 内（防符号链接逃逸）
                 if not any(real == r or real.startswith(r + os.sep) for r in roots):
                     continue
                 try:
@@ -188,21 +212,19 @@ def scan_all(uid: str):
                 except OSError:
                     continue
                 bid = hash_id_for(real)
-                # 真实文件夹路径
                 real_dir = os.path.dirname(real)
-                # 真实文件夹路径 ID
                 dirpath_id = hash_id_for(real_dir)
 
                 file_map[bid] = {
                     "id": bid,
                     "fid": dirpath_id,
-                    "name": fn,  # 文件名
+                    "name": fn,
                     "path": real,
                     "folder_name": os.path.basename(real_dir),
                     "size": st.st_size,
                     "mtime": int(st.st_mtime),
                     "root": root,
-                    "type": "file",  # 文件类型 和 文件夹类型
+                    "type": "file",
                 }
                 temp_real = real
                 while True:
@@ -215,13 +237,13 @@ def scan_all(uid: str):
                         file_map[folder_id] = {
                             "id": folder_id,
                             "fid": hash_id_for(p_folder_dir),
-                            "name": folder_name,  # 文件夹名
+                            "name": folder_name,
                             "path": temp_real,
-                            "folder_name": p_folder_name,  # 文件夹的父文件夹
+                            "folder_name": p_folder_name,
                             "size": 1,
                             "mtime": 0,
                             "root": root,
-                            "type": "folder",  # 文件类型 和 文件夹类型
+                            "type": "folder",
                         }
                     else:
                         file_map[folder_id]["size"] += 1
@@ -233,7 +255,7 @@ def scan_all(uid: str):
 
 
 # ----------------------------------------------------------------------------
-# 进度持久化（按用户 UID 一个 JSON 文件）
+# 进度持久化
 # ----------------------------------------------------------------------------
 def _progress_dir():
     d = os.path.join(DATA_DIR, "progress")
@@ -314,17 +336,11 @@ def save_file_map(uid, file_map: dict):
         log("save progress failed: %r" % e)
 
 
-def _file_image_file(name: str):
-    d = os.path.join(DATA_DIR, "image")
-    try:
-        os.makedirs(d, exist_ok=True)
-    except OSError:
-        pass
-    return os.path.join(d, name)
-
-
+# ----------------------------------------------------------------------------
+# PDF 处理
+# ----------------------------------------------------------------------------
 def get_doc_meta(entry):
-    """返回文档元信息：页数 + 每页原始尺寸（pt, 72dpi）。"""
+    """返回文档元信息：页数 + 每页原始尺寸"""
     with pymupdf.open(entry['path']) as pdf:
         cnt = pdf.page_count
         pages = []
@@ -337,42 +353,8 @@ def get_doc_meta(entry):
     return {"pageCount": cnt, "pages": pages}
 
 
-def render_page(entry, dpi):
-    dpi = max(36, min(300, int(dpi)))
-    name = F'{entry.get("id", "")}_{dpi}.png'
-    path = _file_image_file(name)
-    exists = os.path.exists(path)
-    if exists:
-        try:
-            with open(path, "rb") as f:
-                return f.read()
-        except (OSError, ValueError):
-            pass
-    with pymupdf.open(entry['path']) as pdf:
-        png_bytes = pdf[0].get_pixmap(
-            dpi=dpi,
-            alpha=False,  # 不需要透明通道更快
-            colorspace=pymupdf.csRGB
-        ).tobytes("png")
-    try:
-        with open(path, "wb") as f:
-            f.write(png_bytes)
-    except (OSError, ValueError):
-        pass
-    return png_bytes
-
-
 def extract_page_pdf(entry: dict, page: int, size: int = 1):
-    """把第 page 页（1-based）抽取成一个独立的小 PDF，返回 bytes。
-    前端用 PDF.js 渲染到 canvas（矢量、可无损缩放、绝不拉伸错乱），
-    且每次只传这一页，不下载整本 PDF。
-
-    智能混合策略（兼顾文本页保真与扫描页提速）：
-      1) 矢量切片 + subset_fonts：仅保留本页字形。文本页实测 28MB→158KB、
-         PDF.js 解析 11s→~0ms，且可无损缩放。
-      2) 若矢量切片仍很大（>阈值，说明本页含高分辨率图片/扫描页，字体子集化无效），
-         自动改走降采样光栅切片：整页重渲染为约 1500px 宽 JPEG 再打包。
-         扫描页实测单页 1.1MB→~290KB，fetch 与浏览器图像解码都大幅加快。"""
+    """把第 page 页（1-based）抽取成一个独立的小 PDF，返回 bytes。"""
     page = int(page)
     _t_req = time.time()
     if page < 0:
@@ -383,7 +365,7 @@ def extract_page_pdf(entry: dict, page: int, size: int = 1):
             return None
         with pymupdf.open() as doc:
             try:
-                doc.insert_pdf(pdf, from_page=page, to_page=min(page + size - 1, cnt - 1))  # C层复制页对象，不落盘
+                doc.insert_pdf(pdf, from_page=page, to_page=min(page + size - 1, cnt - 1))
                 doc.subset_fonts()
                 return doc.tobytes(garbage=4, deflate=True, deflate_fonts=True)
             except Exception:
@@ -391,336 +373,294 @@ def extract_page_pdf(entry: dict, page: int, size: int = 1):
 
 
 # ----------------------------------------------------------------------------
-# 安全：对端进程校验
+# API 路由
 # ----------------------------------------------------------------------------
-def get_peer_uid(sock):
+@app.route(f"{GATEWAY_PREFIX}/api/me", methods=["GET"])
+def api_me():
+    """获取当前用户信息"""
+    user = get_user_from_request()
+    if user is None:
+        abort(403, "Forbidden: gateway auth required")
+    return jsonify({
+        "uid": user["uid"],
+        "username": user["username"],
+        "isAdmin": user["isAdmin"],
+    })
+
+
+@app.route(f"{GATEWAY_PREFIX}/api/books", methods=["GET"])
+def api_books():
+    """获取书库列表"""
+    user = get_user_from_request()
+    if user is None:
+        abort(403, "Forbidden: gateway auth required")
+
+    query_path = request.args.get('path', '')
+    query_scan = request.args.get('scan', '')
+    uid = user["uid"]
+
+    start = time.time()
+    file_map = load_file_map(uid)
+    if len(file_map) == 0 or query_scan == 'all':
+        file_map = scan_all(uid)
+    log('/api/books 耗时 %s 秒' % (time.time() - start))
+
+    real_root_ids = []
+    if query_path == "":
+        for root in LIBRARY_ROOTS:
+            real_root = os.path.realpath(root)
+            real_root_ids.append(hash_id_for(real_root))
+    else:
+        real_root_ids.append(query_path)
+
+    books = []
+    history = []
+    progress = load_progress(user["uid"])
+    p_keys = progress.keys()
+    for k, v in file_map.items():
+        tmp_b = {k: v[k] for k in
+                 ("id", "fid", "name", "size", "mtime", "type")}
+        if v and v.get("fid", "") in real_root_ids:
+            # 洗一下避免文件路径信息泄露
+            books.append(tmp_b)
+        if k in p_keys and len(history) < 10:
+            tmp_b["progress"] = {
+                "page": progress[k].get("page", 0),
+                "totalPages": progress[k].get("totalPages", 0),
+                "percent": progress[k].get("percent", 0),
+                "updatedAt": progress[k].get("updatedAt", 0),
+            }
+            history.append(tmp_b)
+    history.sort(key=lambda x: x["progress"].get("updatedAt", 0), reverse=True)
+    return jsonify({"books": books, "history": history, "count": len(books)})
+
+
+@app.route(f"{GATEWAY_PREFIX}/api/meta", methods=["GET"])
+def api_meta():
+    """获取文档元信息"""
+    user = get_user_from_request()
+    if user is None:
+        abort(403, "Forbidden: gateway auth required")
+
+    bid = request.args.get('id', '')
+    uid = user["uid"]
+    file_map = load_file_map(uid)
+    book_entry = file_map.get(bid, {})
+
+    if not book_entry or book_entry.get('type', '') != 'file':
+        abort(404, "book not found")
+
     try:
-        SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
-        creds = sock.getsockopt(socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i"))
-        pid, uid, gid = struct.unpack("3i", creds)
-        return uid
-    except (OSError, AttributeError, struct.error):
-        return None
+        meta = get_doc_meta(book_entry)
+        meta["id"] = bid
+        meta["name"] = book_entry["name"]
+        meta["progress"] = load_progress(uid).get(bid, {})
+        return jsonify(meta)
+    except Exception as e:
+        log("meta error %s: %r" % (book_entry.get("name"), e))
+        return jsonify({"error": "meta_failed", "detail": str(e)}), 500
 
 
-def peer_allowed(sock):
-    if not PEERCRED_CHECK or TCP_PORT:
-        return True
-    uid = get_peer_uid(sock)
-    if uid is None:
-        return os.getuid() != 0
-    if uid == 0 or uid == os.getuid():
-        return True
-    return uid in ALLOW_UIDS
+@app.route(f"{GATEWAY_PREFIX}/api/pagepdf", methods=["GET"])
+def api_pagepdf():
+    """获取单页 PDF 切片"""
+    user = get_user_from_request()
+    if user is None:
+        abort(403, "Forbidden: gateway auth required")
+
+    bid = request.args.get('id', '')
+    uid = user["uid"]
+    start = time.time()
+
+    try:
+        page = int(request.args.get('page', 1))
+    except ValueError:
+        abort(400, "bad page")
+
+    try:
+        size = int(request.args.get('size', 1))
+    except ValueError:
+        abort(400, "bad size")
+
+    file_map = load_file_map(uid)
+    entry = file_map.get(bid, {})
+
+    if not entry or entry.get('type', '') != 'file':
+        abort(404, "book not found")
+
+    try:
+        data = extract_page_pdf(entry, page, size)
+    except Exception as e:
+        log("slice error %s p%s: %r" % (entry.get("name"), page, e))
+        abort(500, "slice failed")
+
+    if data is None:
+        abort(404, "page out of range")
+
+    log(f"{bid} 请求第 {page} 页耗时：{time.time() - start} 秒")
+    return send_file(
+        io.BytesIO(data),
+        mimetype="application/pdf",
+        as_attachment=False,
+    )
 
 
-# ----------------------------------------------------------------------------
-# HTTP 请求处理
-# ----------------------------------------------------------------------------
-class Handler(socketserver.StreamRequestHandler):
+def render_page(entry, page: int, dpi: int):
+    """渲染PDF页面为图片，并进行纯Python优化"""
+    dpi = max(36, min(500, int(dpi)))
+    name = f'{entry.get("id", "")}_{page}_{dpi}.png'
+    path = os.path.join(DATA_DIR, "image", name)
 
-    def _parse_request(self):
-        line = self.rfile.readline(65536).decode("latin-1").strip()
-        if not line:
-            return None
-        parts = line.split(" ")
-        if len(parts) < 2:
-            return None
-        method, path = parts[0], parts[1]
-        headers = {}
-        while True:
-            h = self.rfile.readline(65536).decode("latin-1")
-            if h in ("\r\n", "\n", ""):
-                break
-            if ":" in h:
-                k, v = h.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-        return method, path, headers
-
-    def _read_body(self, headers):
+    # 检查缓存
+    exists = os.path.exists(path)
+    if exists and False:
         try:
-            n = int(headers.get("content-length", "0"))
-        except ValueError:
-            n = 0
-        if n <= 0:
-            return b""
-        return self.rfile.read(n)
-
-    def _send_http(self, status, body=b"", ctype="text/plain; charset=utf-8", extra=None):
-        if isinstance(body, str):
-            body = body.encode("utf-8")
-        out = ["HTTP/1.1 %s" % status,
-               "Content-Type: %s" % ctype,
-               "Content-Length: %d" % len(body),
-               "Cache-Control: no-store",
-               "Connection: close"]
-        # CORS头现在通过extra参数传入，避免重复设置
-        if extra:
-            out += extra
-        self.wfile.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"))
-        if body:
-            self.wfile.write(body)
-
-    def _send_json(self, obj, status="200 OK"):
-        cors_headers = [
-            "Access-Control-Allow-Origin: *",
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers: x-trim-userid, x-trim-isadmin, x-trim-username, content-type"
-        ]
-        self._send_http(status, json.dumps(obj, ensure_ascii=False),
-                        ctype="application/json; charset=utf-8", extra=cors_headers)
-
-    def _auth(self, headers):
-        uid = headers.get("x-trim-userid")
-        is_admin = headers.get("x-trim-isadmin") == "true"
-        username = headers.get("x-trim-username")
-        if REQUIRE_AUTH and not uid:
-            return None
-        if not uid:
-            uid = "debug"  # 本地调试 REQUIRE_AUTH=0 时
-        return {"uid": uid, "isAdmin": is_admin, "username": username or uid}
-
-    def handle(self):
-        try:
-            if not peer_allowed(self.connection):
-                uid = get_peer_uid(self.connection)
-                log("REJECT direct connection from uid=%s" % uid)
-                cors_headers = [
-                    "Access-Control-Allow-Origin: *",
-                    "Access-Control-Allow-Methods: GET, POST, OPTIONS",
-                    "Access-Control-Allow-Headers: x-trim-userid, x-trim-isadmin, x-trim-username, content-type"
-                ]
-                self._send_http("403 Forbidden", b"Forbidden: untrusted peer", extra=cors_headers)
-                return
-
-            req = self._parse_request()
-            if not req:
-                return
-            method, raw_path, headers = req
-            inner = strip_prefix(raw_path)
-            if os.environ.get("PDFR_DEBUG_REQ"):
-                log("REQ %s raw=%r inner=%r" % (method, raw_path, inner))
-            qs = ""
-            if "?" in raw_path:
-                qs = raw_path.split("?", 1)[1]
-            query = urllib.parse.parse_qs(qs)
-
-            user = self._auth(headers)
-            if user is None:
-                self._send_http("403 Forbidden", b"Forbidden: gateway auth required")
-                return
-
-            path_only = inner.split("?", 1)[0].rstrip("/")
-            print('method', method, 'path_only', path_only, 'query', query)
-
-            # ---- API 路由 ----
-
-            if path_only == "/api/me":
-                self._send_json({"uid": user["uid"], "username": user["username"],
-                                 "isAdmin": user["isAdmin"], })
-                return
-
-            if path_only == "/api/books":
-                quert_path = query.get('path', [''])[0]
-                quert_scan = query.get('scan', [''])[0]
-                uid = user["uid"]
-                start = time.time()
-                if quert_scan == 'all':
-                    file_map = scan_all(uid)
-                else:
-                    file_map = load_file_map(uid)
-                print('/api/books 耗时', time.time() - start, '秒')
-                real_root_ids = []
-                if quert_path == "":
-                    # 根目录
-                    real_root_ids = []
-                    for root in LIBRARY_ROOTS:
-                        real_root = os.path.realpath(root)
-                        real_root_ids.append(hash_id_for(real_root))
-                else:
-                    # 二级目录
-                    real_root_ids.append(quert_path)
-                # 遍历所有当前路径下的文件
-                books = []
-                history = []
-                progress = load_progress(user["uid"])
-                p_keys = progress.keys()
-                for k, v in file_map.items():
-                    tmp_b = {k: v[k] for k in
-                             ("id", "fid", "name", "size", "mtime", "type")}
-                    if v and v.get("fid", "") in real_root_ids:
-                        # 洗一下避免文件路径信息泄露
-                        books.append(tmp_b)
-                    if k in p_keys and len(history) < 10:
-                        tmp_b["progress"] = {
-                            "page": progress[k].get("page", 0),
-                            "totalPages": progress[k].get("totalPages", 0),
-                            "percent": progress[k].get("percent", 0),
-                            "updatedAt": progress[k].get("updatedAt", 0),
-                        }
-                        history.append(tmp_b)
-                self._send_json({"books": books, "history": history, "count": len(books), })
-                return
-
-            # ---- 文档元信息：页数 + 每页尺寸（前端据此排版占位，不下载原文件）----
-            if path_only == "/api/meta":
-                bid = query.get("id", [""])[0]
-                uid = user["uid"]
-                file_map = load_file_map(uid)
-                bookEntry = file_map.get(bid, {})
-                if not bookEntry or bookEntry.get('type', '') != 'file':
-                    self._send_http("404 Not Found", b"book not found")
-                    return
-                try:
-                    meta = get_doc_meta(bookEntry)
-                    meta["id"] = bid
-                    meta["name"] = bookEntry["name"]
-                    meta["progress"] = load_progress(uid).get(bid, {})
-                    self._send_json(meta)
-                except Exception as e:  # noqa
-                    log("meta error %s: %r" % (bookEntry.get("name"), e))
-                    self._send_json({"error": "meta_failed", "detail": str(e)},
-                                    status="500 Internal Server Error")
-                return
-
-            # ---- 服务端渲染：返回指定页的图片（原文件绝不下载到连接端）----
-            if path_only == "/api/page":
-                bid = query.get("id", [""])[0]
-                uid = user["uid"]
-                file_map = load_file_map(uid)
-                entry = file_map.get(bid, {})
-                if not entry or entry.get('type', '') != 'file':
-                    self._send_http("404 Not Found", b"book not found")
-                    return
-                if method not in ("GET", "HEAD"):
-                    self._send_http("405 Method Not Allowed", b"method not allowed")
-                    return
-                try:
-                    res = render_page(entry, 80)
-                except Exception as e:  # noqa
-                    self._send_http("500 Internal Server Error", b"render failed")
-                    return
-                if res is None:
-                    self._send_http("404 Not Found", b"page out of range")
-                    return
-                base64_data = base64.b64encode(res).decode('utf-8')
-                data_url = f"data:image/png;base64,{base64_data}"
-                # 返回JSON格式的base64图片数据
-                self._send_json({
-                    "success": True,
-                    "base64": f"data:image/png;base64,{base64_data}",
-                    "mimeType": "image/png",
-                    "size": len(res)
-                })
-                return
-
-            # ---- 单页 PDF 切片：把当前阅读页抽成独立小 PDF，前端用 PDF.js 渲染到 canvas。
-            #      矢量渲染、缩放无损、绝不拉伸错乱；每次只传一页（几 KB），不下载整本。----
-            if path_only == "/api/pagepdf":
-                bid = query.get("id", [""])[0]
-                uid = user["uid"]
-                start = time.time()
-                try:
-                    page = int((query.get("page") or ["1"])[0])
-                except ValueError:
-                    self._send_http("400 Bad Request", "bad page")
-                    return
-                try:
-                    size = int((query.get("size") or ["1"])[0])
-                except ValueError:
-                    self._send_http("400 Bad Request", "bad page")
-                    return
-                file_map = load_file_map(uid)
-                entry = file_map.get(bid, {})
-                if not entry or entry.get('type', '') != 'file':
-                    self._send_http("404 Not Found", "book not found")
-                    return
-                if method not in ("GET", "HEAD"):
-                    self._send_http("405 Method Not Allowed", "method not allowed")
-                    return
-                try:
-                    data = extract_page_pdf(entry, page, size)
-                except Exception as e:  # noqa
-                    log("slice error %s p%s: %r" % (entry.get("name"), page, e))
-                    self._send_http("500 Internal Server Error", "slice failed")
-                    return
-                if data is None:
-                    self._send_http("404 Not Found", "page out of range")
-                    return
-                self._send_http("200 OK", b"" if method == "HEAD" else data,
-                                ctype="application/pdf")
-                print(F'{bid} 请求第 {page} 页耗时：{time.time() - start} 秒')
-                return
-
-            if path_only == "/api/progress":
-                bid = (query.get("id") or [""])[0]
-                if method == "GET":
-                    prog = load_progress(user["uid"])
-                    self._send_json({"id": bid, "progress": prog.get(bid)})
-                    return
-                if method == "POST":
-                    body = self._read_body(headers)
-                    try:
-                        payload = json.loads(body.decode("utf-8")) if body else {}
-                    except ValueError:
-                        self._send_http("400 Bad Request", "invalid json")
-                        return
-                    bid = payload.get("id") or bid
-                    if not bid:
-                        self._send_http("400 Bad Request", "missing id")
-                        return
-                    entry = {}
-                    # frac: 页内滚动比例(0~1)，跨设备对齐的关键
-                    for k in ("page", "frac", "name", "scale", "totalPages", "percent"):
-                        if k in payload:
-                            entry[k] = payload[k]
-                    saved = save_progress_entry(user["uid"], bid, entry)
-                    self._send_json({"ok": saved is not None, "progress": saved})
-                    return
-                self._send_http("405 Method Not Allowed", "method not allowed")
-                return
-
-            # ---- 静态文件 ----
-            if method not in ("GET", "HEAD"):
-                self._send_http("405 Method Not Allowed", "method not allowed")
-                return
-            rel = path_only if path_only else "/"
-            if rel in ("", "/"):
-                rel = "/index.html"
-            full = safe_join(WEB_ROOT, rel)
-            if not full or not os.path.isfile(full):
-                full = os.path.join(WEB_ROOT, "index.html")
-                if not os.path.isfile(full):
-                    diag = ("<!doctype html><meta charset=utf-8>"
-                            "<body style='font-family:sans-serif;padding:24px'>"
-                            "<h2>PDF 阅读器：资源未找到</h2></body>")
-                    self._send_http("404 Not Found", diag, ctype="text/html; charset=utf-8")
-                    return
-            ext = os.path.splitext(full)[1].lower()
-            ctype = MIME.get(ext, "application/octet-stream")
-            with open(full, "rb") as f:
-                data = f.read()
-            if method == "HEAD":
-                data = b""
-            self._send_http("200 OK", data, ctype=ctype)
-        except (BrokenPipeError, ConnectionResetError):
+            with open(path, "rb") as f:
+                cached_data = f.read()
+                # 如果缓存文件是优化后的，直接返回
+                if len(cached_data) > 0:
+                    return cached_data
+        except (OSError, ValueError):
             pass
-        except Exception as e:  # noqa
-            log("handler error: %r" % e)
-            try:
-                self._send_http("500 Internal Server Error", "internal error")
-            except Exception:
-                pass
+
+    with pymupdf.open(entry['path']) as pdf:
+        cnt = pdf.page_count
+        if page > cnt:
+            return None
+        png_bytes = pdf[page].get_pixmap(
+            dpi=dpi,
+            alpha=False,
+            colorspace=pymupdf.csRGB,
+        ).tobytes("png")
+
+    # 应用纯Python优化
+    try:
+        try:
+            # 使用智能优化
+            img = Image.open(io.BytesIO(png_bytes))
+            # --- PNG 量化压缩 ---
+            if img.mode in ("RGBA", "LA"):
+                alpha = img.getchannel("A")
+                p_img = img.convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=192)
+                p_img.putalpha(alpha)
+            else:
+                p_img = img.convert("P", palette=Image.ADAPTIVE, colors=192)
+
+            png_buf = io.BytesIO()
+            p_img.save(png_buf, "PNG", optimize=True)
+            png_bytes = png_buf.getvalue()
+        except ImportError:
+            # 如果优化模块不可用，使用原始PNG
+            log(f"页面{page}: 优化模块不可用，使用原始PNG")
+    except Exception as e:
+        # 任何异常都回退到原始PNG
+        log(f"页面{page}优化异常: {e}")
+
+    # 缓存优化后的图片
+    try:
+        os.makedirs(os.path.join(DATA_DIR, "image"), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(png_bytes)
+    except (OSError, ValueError) as e:
+        log(f"缓存写入失败: {e}")
+
+    return png_bytes
 
 
-class ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    allow_reuse_address = True
+@app.route(f"{GATEWAY_PREFIX}/api/page", methods=["GET"])
+def api_page():
+    """获取指定页的 PNG 图片（返回 base64 JSON）"""
+    user = get_user_from_request()
+    if user is None:
+        abort(403, "Forbidden: gateway auth required")
+
+    bid = request.args.get('id', '')
+    uid = user["uid"]
+    file_map = load_file_map(uid)
+    entry = file_map.get(bid, {})
+
+    if not entry or entry.get('type', '') != 'file':
+        abort(404, "book not found")
+
+    if request.method not in ("GET", "HEAD"):
+        abort(405, "method not allowed")
+
+    # 支持可选的页面和DPI参数
+    try:
+        page = int(request.args.get('page', 0))
+    except ValueError:
+        page = 0
+
+    try:
+        dpi = int(request.args.get('dpi', 80))
+    except ValueError:
+        dpi = 80
+    res = None
+    try:
+        res = render_page(entry, page, dpi)
+    except Exception:
+        abort(500, "render failed")
+
+    if res is None:
+        abort(404, "page out of range")
+
+    # base64_data = base64.b64encode(res).decode('utf-8')
+    # return jsonify({
+    #     "success": True,
+    #     "base64": f"data:image/png;base64,{base64_data}",
+    #     "mimeType": "image/png",
+    #     "size": len(res),
+    #     "page": page,
+    #     "dpi": dpi
+    # })
+    # 直接返回二进制图片数据
+    return send_file(
+        io.BytesIO(res),
+        mimetype="image/png",
+        as_attachment=False,
+        max_age=86400  # 缓存24小时
+    )
 
 
-class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+@app.route(f"{GATEWAY_PREFIX}/api/progress", methods=["GET", "POST"])
+def api_progress():
+    """获取/保存阅读进度"""
+    user = get_user_from_request()
+    if user is None:
+        abort(403, "Forbidden: gateway auth required")
+
+    bid = request.args.get('id', '')
+
+    if request.method == "GET":
+        prog = load_progress(user["uid"])
+        return jsonify({"id": bid, "progress": prog.get(bid)})
+
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        bid = payload.get("id") or bid
+        if not bid:
+            abort(400, "missing id")
+
+        entry = {}
+        for k in ("page", "frac", "name", "scale", "totalPages", "percent"):
+            if k in payload:
+                entry[k] = payload[k]
+
+        saved = save_progress_entry(user["uid"], bid, entry)
+        return jsonify({"ok": saved is not None, "progress": saved})
+
+    abort(405, "method not allowed")
+
+
+# ----------------------------------------------------------------------------
+# 静态文件路由
+# ----------------------------------------------------------------------------
+@app.route(f"{GATEWAY_PREFIX}/")
+def serve_index():
+    """返回 index.html"""
+    if os.path.isfile(os.path.join(WEB_ROOT, "index.html")):
+        return send_from_directory(WEB_ROOT, "index.html")
+    return "PDF 阅读器：前端未构建", 404
 
 
 def main():
@@ -728,44 +668,47 @@ def main():
         os.makedirs(DATA_DIR, exist_ok=True)
     except OSError:
         pass
-    log("webroot=%s (index.html exists=%s)  data_dir=%s  roots=%s"
-        % (WEB_ROOT, os.path.isfile(os.path.join(WEB_ROOT, "index.html")),
-           DATA_DIR, LIBRARY_ROOTS))
 
-    if TCP_PORT:
-        addr = ("127.0.0.1", int(TCP_PORT))
-        srv = ThreadingTCPServer(addr, Handler)
-        log("listening on tcp %s:%s" % addr)
+    log(f"webroot={WEB_ROOT} (index.html exists={os.path.isfile(os.path.join(WEB_ROOT, 'index.html'))})")
+    log(f"data_dir={DATA_DIR}")
+    log(f"roots={LIBRARY_ROOTS}")
+    log(f"prefix={GATEWAY_PREFIX}")
+    log(f"sock_path={SOCK_PATH}")
+
+    # 仅保留本地TCP调试模式
+    if args.port > 0:
+        log(f"Using TCP debug mode on {args.host}:{args.port}")
+        app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
     else:
-        if os.path.exists(SOCK_PATH):
-            try:
-                os.unlink(SOCK_PATH)
-            except OSError:
-                pass
-        srv = ThreadingUnixServer(SOCK_PATH, Handler)
-        try:
-            os.chmod(SOCK_PATH, 0o666)
-        except OSError:
-            pass
-        log("listening on unix %s  prefix=%s" % (SOCK_PATH, GATEWAY_PREFIX))
-
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        srv.server_close()
-        if not TCP_PORT and os.path.exists(SOCK_PATH):
-            try:
-                os.unlink(SOCK_PATH)
-            except OSError:
-                pass
+        from waitress import serve
+        import stat
+        sock_file = SOCK_PATH
+        # 清理残留socket文件
+        if os.path.exists(sock_file):
+            os.unlink(sock_file)
+        log(f"Waitress WSGI listening unix socket: {sock_file}")
+        # 启动WSGI服务，原生支持Unix Socket，自带超时防504
+        serve(
+            app,
+            unix_socket=sock_file,
+            threads=16,
+            connection_limit=128,
+            channel_timeout=180,  # 单次请求最大180秒，解决PDF扫描渲染超时
+            cleanup_interval=10
+        )
+        # 设置socket权限0666，nginx网关可读写
+        os.chmod(
+            sock_file,
+            stat.S_IRUSR | stat.S_IWUSR |
+            stat.S_IRGRP | stat.S_IWGRP |
+            stat.S_IROTH | stat.S_IWOTH
+        )
 
 
 if __name__ == "__main__":
     try:
-        log("=== pdfreader server boot ===  sock=%s webroot=%s prefix=%s py=%s"
-            % (SOCK_PATH, WEB_ROOT, GATEWAY_PREFIX, sys.version.split()[0]))
+        mode = "TCP Debug" if args.port > 0 else "Production(use gunicorn)"
+        log(f"=== pdfreader flask server boot === mode={mode} prefix={GATEWAY_PREFIX} py={sys.version.split()[0]}")
         main()
     except Exception:
         import traceback

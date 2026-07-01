@@ -1,5 +1,7 @@
 # 先设置环境变量
 import os
+import time
+
 os.environ["PDFR_SHARE_PATHS"] = '/Users/king/Downloads:'
 os.environ["PDFR_ACCESSIBLE_PATHS"] = '/Users/king/Github:'
 os.environ["PDFR_GATEWAY_PREFIX"] = '/app/fnnas-pdfreader'
@@ -19,14 +21,9 @@ print(f"PDFR_SOCK: '{os.environ.get('PDFR_SOCK')}'")
 print("========================")
 
 # 现在导入 Flask 版本
-import pdfserver_flask as pdfserver
+import pdfserver as pdfserver
 
 if __name__ == '__main__':
-    # Flask 版本本地调试：使用 TCP 模式，端口 5173
-    print("=== Flask 版本本地调试启动 ===")
-    print("访问地址: http://127.0.0.1:5173/app/fnnas-pdfreader/")
-    print("==============================")
-
     try:
         # 使用 TCP 模式启动（--port 5173）
         pdfserver.args.port = 5173
@@ -37,3 +34,10 @@ if __name__ == '__main__':
         import traceback
         traceback.print_exc()
         raise
+    start = time.time()
+    print(len(pdfserver.extract_page_pdf(pdfserver.load_file_map('1213123213')['e995d9129a4b8a74'], 30, 1)),
+          time.time() - start)
+    start = time.time()
+    print(len(pdfserver.render_page(pdfserver.load_file_map('1213123213')['e995d9129a4b8a74'], 30, 180)),
+          time.time() - start)
+    start = time.time()

@@ -3,13 +3,12 @@
     <div class="cover">
       <!-- 封面图 -->
       <img
-          v-if="coverBase64.length > 0"
-          :src="coverBase64"
+          :src="`api/page?id=${encodeURIComponent(props.book.id)}&dpi=80`"
           loading="lazy"
       />
 
       <!-- 占位 -->
-      <div v-show="coverBase64.length <= 0" class="ph">
+      <div class="ph">
         <svg viewBox="0 0 24 24" fill="none">
           <path
               d="M6 2h8l4 4v16H6z"
@@ -47,20 +46,12 @@
 
 <script setup lang="ts">
 import {ref, computed} from 'vue'
-import request from '@/utils/request'
 
 const props = defineProps<{
   book: any
 }>()
 
 const emit = defineEmits(['click'])
-const coverBase64 = ref('')
-
-function loadCoverBase64() {
-  request.get(`page?id=${encodeURIComponent(props.book.id)}`).then((res) => {
-    coverBase64.value = res.data.base64 || ''
-  })
-}
 
 const percent = computed(() => {
   return props.book.progress?.percent ?? 0
@@ -77,8 +68,6 @@ function fmtSize(n: number) {
   if (n < 1048576) return (n / 1024).toFixed(0) + ' KB'
   return (n / 1048576).toFixed(1) + ' MB'
 }
-
-loadCoverBase64()
 
 </script>
 
@@ -113,10 +102,14 @@ loadCoverBase64()
   height: 100%;
   object-fit: cover;
   display: block;
+  position: absolute; /* 封面图：绝对定位 */
+  z-index: 2; /* 在上层 */
 }
 
 .cover .ph {
   color: #b3bccb;
+  position: absolute; /* 封面图：绝对定位 */
+  z-index: 1; /* 在上层 */
 }
 
 .cover .ph svg {
