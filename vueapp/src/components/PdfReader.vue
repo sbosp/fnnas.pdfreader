@@ -2,7 +2,7 @@
   <div class="reader">
     <!-- 工具栏 -->
     <div class="reader-toolbar">
-      <button class="btn" @click="close">← 返回</button>
+      <button class="btn btn-back" @click="close">← 返回</button>
       <span class="doc-title">{{ bookName }}</span>
       <div class="spacer"/>
       <span class="pageinfo">{{ currentPage + 1 }} / {{ total }}</span>
@@ -13,39 +13,42 @@
 
     <!-- 视口 -->
     <div class="image-viewport" ref="viewportRef" @scroll.passive="handleScroll">
-      <div
-          v-for="page in pages"
-          :key="page.pageNum"
-          class="image-page"
-          :data-page-num="page.pageNum"
-          :style="{
-            width: page.displayWidth + 'px',
-            height: page.displayHeight + 'px',
-          }"
-      >
-        <!-- 图片：只有 src 被赋值后才真正请求 -->
-        <img
-            v-if="page.src"
-            :src="page.src"
-            :alt="'第' + (page.pageNum + 1) + '页'"
-            class="page-img"
-            @load="onImageLoad(page.pageNum)"
-            @error="onImageError(page.pageNum)"
-        />
-        <!-- 占位/加载/失败 -->
-        <div v-if="!page.loaded && !page.error" class="ph-overlay">
-          <div class="ph-icon">
-            <svg viewBox="0 0 24 24" fill="none">
-              <path d="M6 2h8l4 4v16H6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-              <path d="M14 2v4h4" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-            </svg>
+      <!-- 内容轨道：宽度取最宽页面，放大后可左右拖动查看全部内容，缩小时居中 -->
+      <div class="pages-track">
+        <div
+            v-for="page in pages"
+            :key="page.pageNum"
+            class="image-page"
+            :data-page-num="page.pageNum"
+            :style="{
+              width: page.displayWidth + 'px',
+              height: page.displayHeight + 'px',
+            }"
+        >
+          <!-- 图片：只有 src 被赋值后才真正请求 -->
+          <img
+              v-if="page.src"
+              :src="page.src"
+              :alt="'第' + (page.pageNum + 1) + '页'"
+              class="page-img"
+              @load="onImageLoad(page.pageNum)"
+              @error="onImageError(page.pageNum)"
+          />
+          <!-- 占位/加载/失败 -->
+          <div v-if="!page.loaded && !page.error" class="ph-overlay">
+            <div class="ph-icon">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path d="M6 2h8l4 4v16H6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+                <path d="M14 2v4h4" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+              </svg>
+            </div>
+            <div class="ph-text">
+              {{ page.src ? `加载中 ${page.pageNum + 1}...` : `第 ${page.pageNum + 1} 页` }}
+            </div>
           </div>
-          <div class="ph-text">
-            {{ page.src ? `加载中 ${page.pageNum + 1}...` : `第 ${page.pageNum + 1} 页` }}
+          <div v-if="page.error" class="err-overlay" @click="retryPage(page.pageNum)">
+            <div>加载失败，点击重试</div>
           </div>
-        </div>
-        <div v-if="page.error" class="err-overlay" @click="retryPage(page.pageNum)">
-          <div>加载失败，点击重试</div>
         </div>
       </div>
     </div>
@@ -67,6 +70,8 @@ const bookId = ref<string>('')
 const bookName = ref('')
 const total = ref(0)
 const currentPage = ref(0)
+// 进度恢复用：起始页 + 页内比例(0~1)，与设备/缩放无关
+const startFrac = ref(0)
 
 // ============ 缩放 ============
 const zoomLevels = [0.5, 0.75, 1, 1.25, 1.5, 2]
@@ -284,15 +289,16 @@ function updateCurrentPageFromScroll() {
   const scrollTop = vp.scrollTop
   const viewCenter = scrollTop + vp.clientHeight / 2
 
-  // 二分查找当前中心所在的页
+  // 查找当前视口中心所在的页
   let acc = 0
   for (let i = 0; i < pages.length; i++) {
     const h = pages[i].displayHeight + 20 // 20 = margin-bottom
     if (viewCenter >= acc && viewCenter < acc + h) {
-      if (currentPage.value !== i) {
-        currentPage.value = i
-        saveProgress(i, i / Math.max(1, total.value - 1))
-      }
+      currentPage.value = i
+      // frac = 视口中心在「本页(含下边距)」内的相对比例(0~1)，与设备/缩放无关。
+      // 持续保存(不只在换页时)，保证同一页内的滚动位置也能被记录并跨端恢复。
+      const inPageFrac = Math.min(1, Math.max(0, (viewCenter - acc) / h))
+      saveProgress(i, inPageFrac)
       return
     }
     acc += h
@@ -348,6 +354,8 @@ async function loadMeta() {
     total.value = data.pageCount || 0
     bookName.value = data.name || ''
     currentPage.value = data.progress?.page || 0
+    // 页内比例：兼容旧记录(可能无 frac 字段)
+    startFrac.value = typeof data.progress?.frac === 'number' ? data.progress.frac : 0
 
     // 初始化 pages 数组
     pages.length = 0
@@ -379,22 +387,25 @@ async function loadMeta() {
     // 挂载 IntersectionObserver
     setupObserver()
 
-    // 滚动到起始页
-    scrollToPage(currentPage.value)
+    // 滚动到起始页 + 页内比例，精确恢复上次阅读位置
+    scrollToPage(currentPage.value, startFrac.value)
   } catch (e) {
     console.error('加载文档元数据失败', e)
   }
 }
 
-// 滚动到指定页
-function scrollToPage(pageNum: number) {
+// 滚动到指定页；frac 为该页(含下边距)内的相对位置(0~1)
+function scrollToPage(pageNum: number, frac = 0) {
   const vp = viewportRef.value
   if (!vp) return
   let top = 0
   for (let i = 0; i < pageNum && i < pages.length; i++) {
     top += pages[i].displayHeight + 20
   }
-  vp.scrollTop = top
+  // 叠加页内比例：让视口中心落在「本页顶部 + frac × 本页高度」处
+  const h = (pages[pageNum]?.displayHeight || 0) + 20
+  top += h * frac - vp.clientHeight / 2
+  vp.scrollTop = Math.max(0, top)
 }
 
 // ============ 缩放 ============
@@ -529,19 +540,38 @@ function close() {
 .image-viewport {
   flex: 1;
   overflow-y: auto;
-  overflow-x: hidden;
+  /* 放大后页面可能宽于视口，开启横向滚动以便左右拖动查看全部内容 */
+  overflow-x: auto;
   position: relative;
   background: #f5f5f5;
   padding: 12px 0;
+  -webkit-overflow-scrolling: touch;
+  /* 允许双向平移手势（拖动查看放大后的内容） */
+  touch-action: pan-x pan-y;
+  overscroll-behavior: contain;
+}
+
+/* 内容轨道：宽度取最宽页面(max-content)，且至少撑满视口(min-width:100%)。
+   - 页面宽于视口时：轨道变宽 → 出现横向滚动条，左右两侧均可拖到，不再被裁剪。
+   - 页面窄于视口时：轨道=100% + 居中，页面保持水平居中。 */
+.pages-track {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: max-content;
+  min-width: 100%;
+  box-sizing: border-box;
+  padding: 0 12px;
 }
 
 .image-page {
   position: relative;
   background: #fff;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  margin: 0 auto 20px;
+  margin: 0 0 20px;
   overflow: hidden;
   contain: layout paint;
+  flex: 0 0 auto;
 }
 
 .page-img {
@@ -584,5 +614,44 @@ function close() {
   font-size: 13px;
   color: #f56c6c;
   cursor: pointer;
+}
+
+/* ============ 手机端适配 ============ */
+@media (max-width: 640px) {
+  .reader-toolbar {
+    flex: 0 0 44px;
+    gap: 4px;
+    padding: 0 6px;
+  }
+
+  /* 窄屏收紧各控件，避免整条工具栏超出一屏宽度 */
+  .reader-toolbar .doc-title {
+    max-width: 26vw;
+    font-size: 12px;
+  }
+
+  .reader-toolbar .pageinfo {
+    font-size: 12px;
+  }
+
+  .reader-toolbar .zoom {
+    min-width: 34px;
+    font-size: 12px;
+  }
+
+  .reader-toolbar .btn {
+    font-size: 16px;
+    padding: 0 4px;
+  }
+
+  /* 返回按钮只留箭头，节省横向空间 */
+  .reader-toolbar .btn-back {
+    font-size: 0;
+  }
+
+  .reader-toolbar .btn-back::before {
+    content: '←';
+    font-size: 18px;
+  }
 }
 </style>
