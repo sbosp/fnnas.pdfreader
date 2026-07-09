@@ -68,6 +68,17 @@ const currentLevel = computed(() => {
 // 目录数据内存缓存：key=folderId('' 表示根)，返回上一级时立即命中，避免异步空窗导致的列表闪动
 const pageCache = new Map()
 
+// 轻量比较：网络返回的数据与当前显示是否一致（列表长度 + 每项 id/进度）
+function sigOf(list) {
+  return (list || []).map(b => `${b.id}:${b.type || ''}:${b.page ?? ''}:${b.pageCount ?? ''}`).join('|')
+}
+
+function sameSnapshot(books, history, uname) {
+  return uname === username.value
+      && sigOf(books) === sigOf(allBooks.value)
+      && sigOf(history) === sigOf(recentBooks.value)
+}
+
 const refreshPage = (scan = "", path = '') => {
   if (path === '') {
     path = route.params?.folderId || ''
@@ -75,9 +86,11 @@ const refreshPage = (scan = "", path = '') => {
 
   // 命中缓存则先瞬时渲染，返回/切换目录时不再出现「旧列表→新列表」的跳变。
   // scan==='all'（手动刷新）时强制走网络，不吃缓存。
+  let hitCache = false
   if (scan !== 'all') {
     const cached = pageCache.get(path)
     if (cached) {
+      hitCache = true
       allBooks.value = cached.books
       recentBooks.value = cached.history
       username.value = cached.username
@@ -89,6 +102,8 @@ const refreshPage = (scan = "", path = '') => {
     const history = data.data.history || []
     const uname = data.data.username || '用户'
     pageCache.set(path, {books, history, username: uname})
+    // 命中缓存且网络数据与当前一致时跳过赋值，避免二次渲染引发闪动
+    if (hitCache && sameSnapshot(books, history, uname)) return
     allBooks.value = books
     recentBooks.value = history
     username.value = uname
@@ -247,11 +262,16 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;          /* 允许收缩，避免顶开右侧的用户名 */
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .topbar .brand svg {
   width: 20px;
   height: 20px;
+  flex: 0 0 auto;
 }
 
 .topbar .spacer {
@@ -263,6 +283,8 @@ onMounted(() => {
   color: var(--sub);
   cursor: pointer;
   user-select: none;
+  flex: 0 0 auto;        /* 不被压缩，始终可见 */
+  white-space: nowrap;
 }
 
 .btn {
@@ -291,7 +313,11 @@ onMounted(() => {
 /* 书架样式 */
 .shelf-wrap {
   flex: 1;
-  overflow: auto;
+  min-height: 0;               /* flex 子项允许收缩，滚动才落在自己身上而非撑高父级 */
+  /* 始终保留竖向滚动条槽位：内容多/少切换时不再因滚动条有无而横向抖动 */
+  overflow-y: scroll;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
   padding: 18px 22px 28px;
   overflow-anchor: none;
   overscroll-behavior: none;
@@ -463,6 +489,12 @@ onMounted(() => {
   /*手机端隐藏返回按钮*/
   .topbar .brand .btn {
     display: none;
+  }
+
+  /* 手机端收紧品牌文字，给刷新按钮和用户名留出空间 */
+  .topbar .brand {
+    max-width: 40vw;
+    font-size: 14px;
   }
 
 }
