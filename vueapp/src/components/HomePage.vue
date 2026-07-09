@@ -5,12 +5,10 @@ import {request} from '@/utils/request.js'
 import Folder from '@/components/Folder.vue'
 import Book from '@/components/Book.vue'
 import HistoryBook from '@/components/HistoryBook.vue'
-import {PullRefresh} from 'vant'
 
 const router = useRouter()
 const route = useRoute()
 
-const refreshing = ref(false)
 const allBooks = ref([])
 const recentBooks = ref([])
 const username = ref('')
@@ -88,8 +86,6 @@ const refreshPage = (scan = "", path = '') => {
         headers: err.response.headers
       } : null
     })
-  }).finally(() => {
-    refreshing.value = false
   })
 }
 
@@ -158,12 +154,7 @@ onMounted(() => {
   </div>
 
   <!-- 书架内容 -->
-  <pull-refresh class="shelf-wrap"
-                v-model="refreshing"
-                @refresh="refreshPage"
-                success-text="刷新成功"
-                loading-text="正在刷新..."
-  >
+  <div class="shelf-wrap">
     <!-- 最近阅读 -->
     <div class="recent" v-if="recentBooks.length">
       <p class="rhead"><span class="ricon">🕘</span> 最近阅读</p>
@@ -214,7 +205,7 @@ onMounted(() => {
           @click="enterFolder(folder)"
       />
     </div>
-  </pull-refresh>
+  </div>
 
 </template>
 
@@ -446,8 +437,52 @@ onMounted(() => {
 
 /* 响应式设计 */
 @media (max-width: 640px) {
+  .topbar {
+    padding: 0 10px;
+    gap: 8px;
+  }
+
+  /* 用户名隐藏，节省横向空间 */
   .topbar .user {
     display: none;
+  }
+
+  /* 品牌区收紧：隐藏「PDF 阅读器」文字，只留图标 */
+  .topbar .brand {
+    font-size: 0;
+    gap: 0;
+  }
+
+  .topbar .brand svg {
+    width: 22px;
+    height: 22px;
+  }
+
+  /* 返回按钮只留箭头 */
+  .topbar .brand .btn {
+    font-size: 0;
+    padding: 0 8px;
+  }
+
+  .topbar .brand .btn::before {
+    content: '←';
+    font-size: 16px;
+  }
+
+  /* 刷新按钮只留图标 */
+  .topbar .btn.icon {
+    font-size: 0;
+    padding: 0 8px;
+  }
+
+  .topbar .btn.icon::before {
+    content: '⟳';
+    font-size: 16px;
+  }
+
+  /* 书架内边距收紧 */
+  .shelf-wrap {
+    padding: 14px 14px 24px;
   }
 }
 </style>

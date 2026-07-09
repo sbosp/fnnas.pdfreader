@@ -1,6 +1,6 @@
 <template>
   <div class="reader">
-    <!-- 工具栏 -->
+    <!-- 工具栏（手机端隐藏，改用页脚页码 + 双指缩放）-->
     <div class="reader-toolbar">
       <button class="btn btn-back" @click="close">← 返回</button>
       <span class="doc-title">{{ bookName }}</span>
@@ -52,6 +52,9 @@
         </div>
       </div>
     </div>
+
+    <!-- 页脚页码标记（手机端顶部工具栏隐藏时的页码提示）-->
+    <div class="page-footer">{{ currentPage + 1 }} / {{ total }}</div>
   </div>
 </template>
 
@@ -74,9 +77,11 @@ const currentPage = ref(0)
 const startFrac = ref(0)
 
 // ============ 缩放 ============
-const zoomLevels = [0.5, 0.75, 1, 1.25, 1.5, 2]
-const zoomIdx = ref(2)
-const scale = computed(() => zoomLevels[zoomIdx.value])
+// scale 为连续值，按钮走档位、双指走连续缩放
+const MIN_SCALE = 0.5
+const MAX_SCALE = 3
+const zoomLevels = [0.5, 0.75, 1, 1.25, 1.5, 2, 3]
+const scale = ref(1)
 const zoomLabel = computed(() => `${Math.round(scale.value * 100)}%`)
 
 // ============ 常量配置 ============
@@ -409,65 +414,118 @@ function scrollToPage(pageNum: number, frac = 0) {
 }
 
 // ============ 缩放 ============
-// 缩放时保持当前页在视口位置：记录中心页的相对位置，缩放后滚动到相同位置
-function applyZoom(newIdx: number) {
+// 缩放时保持锚点位置：可传入视口内的锚点 y（默认视口中心），缩放后该点尽量停在原处
+function applyZoom(newScale: number, anchorClientY?: number) {
+  newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, newScale))
   const vp = viewportRef.value
   if (!vp) {
-    zoomIdx.value = newIdx
+    scale.value = newScale
     recomputeAllSizes()
     return
   }
 
-  // 记录当前视口中心相对于当前页顶部的比例
+  // 锚点：默认视口垂直中心
+  const anchorY = anchorClientY ?? vp.clientHeight / 2
   const scrollTop = vp.scrollTop
-  const viewCenter = scrollTop + vp.clientHeight / 2
+  const focus = scrollTop + anchorY
+
+  // 记录锚点相对于所在页顶部的比例
   let acc = 0
   let anchorPage = 0
   let anchorRatio = 0
   for (let i = 0; i < pages.length; i++) {
     const h = pages[i].displayHeight + 20
-    if (viewCenter >= acc && viewCenter < acc + h) {
+    if (focus >= acc && focus < acc + h) {
       anchorPage = i
-      anchorRatio = (viewCenter - acc) / h
+      anchorRatio = (focus - acc) / h
       break
     }
     acc += h
   }
 
   // 应用新缩放（只改显示尺寸，不重设 img.src，浏览器不会重新请求）
-  zoomIdx.value = newIdx
+  scale.value = newScale
   recomputeAllSizes()
 
-  // 恢复到原来的相对位置
+  // 恢复到原来的相对位置：让锚点页的 anchorRatio 处回到 anchorY
   nextTick(() => {
     let top = 0
     for (let i = 0; i < anchorPage && i < pages.length; i++) {
       top += pages[i].displayHeight + 20
     }
-    top += (pages[anchorPage]?.displayHeight || 0) * anchorRatio
-    vp.scrollTop = top - vp.clientHeight / 2
+    top += ((pages[anchorPage]?.displayHeight || 0) + 20) * anchorRatio
+    vp.scrollTop = Math.max(0, top - anchorY)
   })
 }
 
 function zoomIn() {
-  if (zoomIdx.value < zoomLevels.length - 1) {
-    applyZoom(zoomIdx.value + 1)
-  }
+  const next = zoomLevels.find(z => z > scale.value + 1e-6)
+  if (next !== undefined) applyZoom(next)
 }
 
 function zoomOut() {
-  if (zoomIdx.value > 0) {
-    applyZoom(zoomIdx.value - 1)
+  const prev = [...zoomLevels].reverse().find(z => z < scale.value - 1e-6)
+  if (prev !== undefined) applyZoom(prev)
+}
+
+// ============ 双指缩放手势（原生 pinch 已被全局 viewport 禁用，这里自己实现）============
+let pinchStartDist = 0     // 双指初始距离
+let pinchStartScale = 1    // 双指开始时的 scale
+let pinchAnchorY = 0       // 双指中点相对视口顶部的 y（缩放锚点）
+let pinching = false
+
+function touchDist(t0: Touch, t1: Touch) {
+  const dx = t0.clientX - t1.clientX
+  const dy = t0.clientY - t1.clientY
+  return Math.hypot(dx, dy)
+}
+
+function onTouchStart(e: TouchEvent) {
+  if (e.touches.length === 2) {
+    pinching = true
+    pinchStartDist = touchDist(e.touches[0], e.touches[1])
+    pinchStartScale = scale.value
+    const vp = viewportRef.value
+    const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2
+    // 转成相对视口顶部的坐标作为缩放锚点
+    pinchAnchorY = vp ? midY - vp.getBoundingClientRect().top : midY
   }
+}
+
+function onTouchMove(e: TouchEvent) {
+  if (!pinching || e.touches.length !== 2) return
+  e.preventDefault() // 阻止页面滚动，专注缩放
+  const dist = touchDist(e.touches[0], e.touches[1])
+  if (pinchStartDist <= 0) return
+  const target = pinchStartScale * (dist / pinchStartDist)
+  applyZoom(target, pinchAnchorY)
+}
+
+function onTouchEnd(e: TouchEvent) {
+  if (e.touches.length < 2) pinching = false
 }
 
 // ============ 生命周期 ============
 onMounted(async () => {
   bookId.value = route.params.bookId as string
   await loadMeta()
+  const vp = viewportRef.value
+  if (vp) {
+    vp.addEventListener('touchstart', onTouchStart, {passive: true})
+    vp.addEventListener('touchmove', onTouchMove, {passive: false})
+    vp.addEventListener('touchend', onTouchEnd, {passive: true})
+    vp.addEventListener('touchcancel', onTouchEnd, {passive: true})
+  }
 })
 
 onUnmounted(() => {
+  const vp = viewportRef.value
+  if (vp) {
+    vp.removeEventListener('touchstart', onTouchStart)
+    vp.removeEventListener('touchmove', onTouchMove)
+    vp.removeEventListener('touchend', onTouchEnd)
+    vp.removeEventListener('touchcancel', onTouchEnd)
+  }
   teardownObserver()
   loader.clear()
   pages.length = 0
@@ -616,42 +674,33 @@ function close() {
   cursor: pointer;
 }
 
+/* 页脚页码浮标：桌面端隐藏，手机端顶部工具栏隐藏后作为页码提示 */
+.page-footer {
+  display: none;
+  position: fixed;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  z-index: 20;
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+
 /* ============ 手机端适配 ============ */
 @media (max-width: 640px) {
+  /* 手机端隐藏顶部工具栏，改用双指缩放 + 页脚页码 */
   .reader-toolbar {
-    flex: 0 0 44px;
-    gap: 4px;
-    padding: 0 6px;
+    display: none;
   }
 
-  /* 窄屏收紧各控件，避免整条工具栏超出一屏宽度 */
-  .reader-toolbar .doc-title {
-    max-width: 26vw;
-    font-size: 12px;
-  }
-
-  .reader-toolbar .pageinfo {
-    font-size: 12px;
-  }
-
-  .reader-toolbar .zoom {
-    min-width: 34px;
-    font-size: 12px;
-  }
-
-  .reader-toolbar .btn {
-    font-size: 16px;
-    padding: 0 4px;
-  }
-
-  /* 返回按钮只留箭头，节省横向空间 */
-  .reader-toolbar .btn-back {
-    font-size: 0;
-  }
-
-  .reader-toolbar .btn-back::before {
-    content: '←';
-    font-size: 18px;
+  .page-footer {
+    display: block;
   }
 }
 </style>
