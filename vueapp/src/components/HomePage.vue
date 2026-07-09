@@ -65,15 +65,33 @@ const currentLevel = computed(() => {
   return {folders, files}
 })
 
+// 目录数据内存缓存：key=folderId('' 表示根)，返回上一级时立即命中，避免异步空窗导致的列表闪动
+const pageCache = new Map()
+
 const refreshPage = (scan = "", path = '') => {
-  console.log('refreshPage 哦额份份额我怕', route.params)
   if (path === '') {
     path = route.params?.folderId || ''
   }
+
+  // 命中缓存则先瞬时渲染，返回/切换目录时不再出现「旧列表→新列表」的跳变。
+  // scan==='all'（手动刷新）时强制走网络，不吃缓存。
+  if (scan !== 'all') {
+    const cached = pageCache.get(path)
+    if (cached) {
+      allBooks.value = cached.books
+      recentBooks.value = cached.history
+      username.value = cached.username
+    }
+  }
+
   request.get(`books?path=${path}&scan=${scan}`).then((data) => {
-    allBooks.value = data.data.books || []
-    recentBooks.value = data.data.history || []
-    username.value = data.data.username || '用户'
+    const books = data.data.books || []
+    const history = data.data.history || []
+    const uname = data.data.username || '用户'
+    pageCache.set(path, {books, history, username: uname})
+    allBooks.value = books
+    recentBooks.value = history
+    username.value = uname
   }).catch((err) => {
     console.error('❌ books请求失败:', {
       message: err.message,
@@ -149,8 +167,8 @@ onMounted(() => {
       PDF 阅读器
     </span>
     <div class="spacer"></div>
-    <button class="btn icon" @click="refreshClick" title="刷新书库">⟳ 刷新</button>
-    <span class="user" @click="onUserClick">👤 {{ username}}</span>
+    <button class="btn icon" @click="refreshClick" title="刷新书库">刷新</button>
+    <span class="user" @click="onUserClick">{{ username }}</span>
   </div>
 
   <!-- 书架内容 -->
@@ -442,48 +460,11 @@ onMounted(() => {
     gap: 8px;
   }
 
-  /* 用户名隐藏，节省横向空间 */
-  .topbar .user {
+  /*手机端隐藏返回按钮*/
+  .topbar .brand .btn {
     display: none;
   }
 
-  /* 品牌区收紧：隐藏「PDF 阅读器」文字，只留图标 */
-  .topbar .brand {
-    font-size: 0;
-    gap: 0;
-  }
-
-  .topbar .brand svg {
-    width: 22px;
-    height: 22px;
-  }
-
-  /* 返回按钮只留箭头 */
-  .topbar .brand .btn {
-    font-size: 0;
-    padding: 0 8px;
-  }
-
-  .topbar .brand .btn::before {
-    content: '←';
-    font-size: 16px;
-  }
-
-  /* 刷新按钮只留图标 */
-  .topbar .btn.icon {
-    font-size: 0;
-    padding: 0 8px;
-  }
-
-  .topbar .btn.icon::before {
-    content: '⟳';
-    font-size: 16px;
-  }
-
-  /* 书架内边距收紧 */
-  .shelf-wrap {
-    padding: 14px 14px 24px;
-  }
 }
 </style>
 
