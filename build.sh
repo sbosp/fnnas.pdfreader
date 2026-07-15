@@ -2,22 +2,22 @@
 
 # PDF Reader 编译脚本（Rust + lopdf 版）
 # 用法:
-#   bash build.sh        # 默认 debug 模式：交叉编译(debug 快) → appcenter-cli install-local 安装到 fnOS 调试
-#   bash build.sh -r     # release 模式：交叉编译(release 精简) → fnpack build 打包 fpk
+#   bash build.sh        # 默认 debug 模式：编译(debug 快) → appcenter-cli install-local 安装到 fnOS 调试
+#   bash build.sh -r     # release 模式：编译(release 精简) → fnpack build 打包 fpk
+#
+# 自动判断宿主机架构：
+#   * 在飞牛 NAS（aarch64 Linux）本机上跑 → 原生编译（cargo build，无需 rustup/zig/交叉工具链）
+#   * 在 macOS / x86 等异架构上跑        → 交叉编译到 aarch64-unknown-linux-musl
+#                                          （首选 cargo-zigbuild，回退 cross+Docker）
 #
 # 流程：
 #   1) 编译 Vue 前端 → 复制到 fpk 的 app/ui
-#   2) 交叉编译 Rust 服务端到 aarch64 Linux(musl 静态) → 复制到 fpk 的 app/server/pdfserver
-#      - debug   : cargo zigbuild            （编译快，二进制大，用于本地调试）
-#      - release : cargo zigbuild --release  （opt/strip，二进制小，用于发布）
+#   2) 编译 Rust 服务端到 aarch64 Linux → 复制到 fpk 的 app/server/pdfserver
+#      - debug   : 无 --release（编译快，二进制大，用于本地调试）
+#      - release : --release（opt/strip，二进制小，用于发布）
 #   3) 收尾：
 #      - debug   : appcenter-cli install-local  （直接安装到 fnOS 调试）
 #      - release : fnpack build                 （打包 fpk 供分发）
-#
-# 交叉编译说明（在 macOS/arm64 上产出飞牛 NAS 的 aarch64-linux 二进制）：
-#   首选 cargo-zigbuild（用 zig 做交叉链接，产出静态 musl 二进制，无 glibc 版本依赖）
-#   回退 cross（需要 Docker）
-# 依赖自检见下方 ensure_rust_toolchain。
 
 set -e
 
@@ -36,8 +36,8 @@ for arg in "$@"; do
         -r|--release) RELEASE=1 ;;
         -h|--help)
             echo "用法: bash build.sh [-r]"
-            echo "  (无参数)   debug 模式：交叉编译 debug 二进制并 appcenter-cli install-local 安装到 fnOS"
-            echo "  -r|--release  release 模式：交叉编译 release 二进制并 fnpack build 打包 fpk"
+            echo "  (无参数)   debug 模式：编译 debug 二进制并 appcenter-cli install-local 安装到 fnOS"
+            echo "  -r|--release  release 模式：编译 release 二进制并 fnpack build 打包 fpk"
             exit 0
             ;;
         *)
@@ -66,32 +66,60 @@ PROJECT_ROOT="$SCRIPT_DIR"
 FNOS_APP_DIR="$PROJECT_ROOT/fnnas.pdfreader"
 RUST_DIR="$PROJECT_ROOT/rustservice"
 
-# 目标三元组：飞牛 NAS 为 aarch64 Linux；musl 静态链接避免 glibc 版本问题
-RUST_TARGET="aarch64-unknown-linux-musl"
+# -----------------------------------------------------------------------------
+# 判断宿主机：aarch64 Linux 原生编译，否则交叉编译到 aarch64-linux-musl
+# -----------------------------------------------------------------------------
+HOST_OS="$(uname -s)"
+HOST_ARCH="$(uname -m)"
+if [ "$HOST_OS" = "Linux" ] && { [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ]; }; then
+    NATIVE=1
+    RUST_TARGET=""   # 原生：不指定 target
+else
+    NATIVE=0
+    RUST_TARGET="aarch64-unknown-linux-musl"
+fi
 
 echo "项目根目录: $PROJECT_ROOT"
 echo "fnOS 应用目录: $FNOS_APP_DIR"
 echo "Rust 服务端目录: $RUST_DIR"
-echo "交叉编译目标: $RUST_TARGET"
+echo "宿主机: ${HOST_OS}/${HOST_ARCH}"
+if [ "$NATIVE" = "1" ]; then
+    echo "编译方式: 原生编译（本机即 aarch64 Linux）"
+else
+    echo "编译方式: 交叉编译 → ${RUST_TARGET}"
+fi
 echo "构建模式: $MODE"
 
 # 定位 cargo / rustup（优先 PATH，其次 ~/.cargo/bin）
-CARGO="$(command -v cargo || echo "$HOME/.cargo/bin/cargo")"
-RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
+CARGO="$(command -v cargo || true)"
+[ -z "$CARGO" ] && [ -x "$HOME/.cargo/bin/cargo" ] && CARGO="$HOME/.cargo/bin/cargo"
+RUSTUP="$(command -v rustup || true)"
+[ -z "$RUSTUP" ] && [ -x "$HOME/.cargo/bin/rustup" ] && RUSTUP="$HOME/.cargo/bin/rustup"
 
 # -----------------------------------------------------------------------------
-# 工具链自检：确保能交叉编译到 aarch64 Linux
+# 工具链自检
 # -----------------------------------------------------------------------------
 ensure_rust_toolchain() {
-    if [ ! -x "$CARGO" ]; then
+    if [ -z "$CARGO" ] || [ ! -x "$CARGO" ]; then
         echo -e "${RED}错误: 未找到 cargo，请先安装 Rust: https://rustup.rs${NC}"
         exit 1
     fi
 
-    # 安装目标标准库
-    if ! "$RUSTUP" target list --installed 2>/dev/null | grep -q "^${RUST_TARGET}$"; then
-        echo "安装 Rust 目标 ${RUST_TARGET} ..."
-        "$RUSTUP" target add "${RUST_TARGET}"
+    # 原生编译：cargo 存在即可，无需 rustup / 交叉后端
+    if [ "$NATIVE" = "1" ]; then
+        echo -e "${GREEN}原生编译，使用 cargo: ${CARGO}${NC}"
+        BUILD_MODE="native"
+        return
+    fi
+
+    # 交叉编译：需要目标标准库 + 交叉后端
+    if [ -n "$RUSTUP" ] && [ -x "$RUSTUP" ]; then
+        if ! "$RUSTUP" target list --installed 2>/dev/null | grep -q "^${RUST_TARGET}$"; then
+            echo "安装 Rust 目标 ${RUST_TARGET} ..."
+            "$RUSTUP" target add "${RUST_TARGET}"
+        fi
+    else
+        echo -e "${YELLOW}警告: 未找到 rustup，跳过 target 安装（假定 ${RUST_TARGET} 标准库已就绪）${NC}"
     fi
 
     # 选择交叉编译后端：cargo-zigbuild 优先，其次 cross
@@ -146,24 +174,29 @@ cp -r dist/* "$UI_DIR/"
 echo -e "${GREEN}前端文件复制完成${NC}"
 
 # =============================================================================
-# [Step 2/3] 交叉编译 Rust 服务端 → aarch64 Linux
+# [Step 2/3] 编译 Rust 服务端 → aarch64 Linux
 # =============================================================================
 echo ""
-echo -e "${YELLOW}[Step 2/3] 交叉编译 Rust 服务端 (${RUST_TARGET}, ${MODE})...${NC}"
+echo -e "${YELLOW}[Step 2/3] 编译 Rust 服务端 (${MODE})...${NC}"
 
 ensure_rust_toolchain
 
 cd "$RUST_DIR"
 
-if [ "$BUILD_MODE" = "zigbuild" ]; then
+if [ "$NATIVE" = "1" ]; then
+    # 原生编译，不指定 target
+    "$CARGO" build ${CARGO_PROFILE_FLAG}
+    BIN_OUT="$RUST_DIR/target/${CARGO_PROFILE_DIR}/pdfserver"
+elif [ "$BUILD_MODE" = "zigbuild" ]; then
     "$CARGO" zigbuild ${CARGO_PROFILE_FLAG} --target "${RUST_TARGET}"
+    BIN_OUT="$RUST_DIR/target/${RUST_TARGET}/${CARGO_PROFILE_DIR}/pdfserver"
 else
     cross build ${CARGO_PROFILE_FLAG} --target "${RUST_TARGET}"
+    BIN_OUT="$RUST_DIR/target/${RUST_TARGET}/${CARGO_PROFILE_DIR}/pdfserver"
 fi
 
-BIN_OUT="$RUST_DIR/target/${RUST_TARGET}/${CARGO_PROFILE_DIR}/pdfserver"
 if [ ! -f "$BIN_OUT" ]; then
-    echo -e "${RED}错误: Rust 交叉编译失败，未找到 $BIN_OUT${NC}"
+    echo -e "${RED}错误: Rust 编译失败，未找到 $BIN_OUT${NC}"
     exit 1
 fi
 
@@ -172,7 +205,7 @@ echo "产物信息:"
 file "$BIN_OUT" || true
 ARCH_OK="$(file "$BIN_OUT" 2>/dev/null | grep -Ei 'ELF.*(aarch64|ARM aarch64)' || true)"
 if [ -z "$ARCH_OK" ]; then
-    echo -e "${RED}错误: 产物不是 aarch64 Linux ELF，请检查交叉编译环境${NC}"
+    echo -e "${RED}错误: 产物不是 aarch64 Linux ELF，请检查编译环境${NC}"
     exit 1
 fi
 
