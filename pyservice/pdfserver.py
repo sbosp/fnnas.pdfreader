@@ -18,6 +18,10 @@ PDF 阅读器 — Flask 版本 (fnOS 统一网关版)
 """
 import argparse
 import base64
+import ctypes
+import ctypes.util
+import functools
+import gc
 import hashlib
 import json
 import os
@@ -127,6 +131,53 @@ def log(msg):
         try:
             with open(LOGFILE, "a") as f:
                 f.write(line)
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# C 层内存回收：PDF 关闭后主动把 MuPDF 缓存 + glibc 空闲堆还给 OS
+# ----------------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _get_libc():
+    """返回带 malloc_trim 的 libc 句柄；不可用时返回 None。
+
+    仅 Linux/glibc 存在 malloc_trim；macOS/musl 上不存在。用 lru_cache 保证
+    探测只跑一次（首次调用时），避免每次回收都 find_library，且无需模块级全局变量。
+    """
+    try:
+        libc_name = ctypes.util.find_library("c")
+        if libc_name:
+            c = ctypes.CDLL(libc_name)
+            if hasattr(c, "malloc_trim"):
+                return c
+    except Exception:
+        pass
+    return None
+
+
+def reclaim_c_memory():
+    """PDF 关闭后调用：清 MuPDF C 层 store 缓存 + gc + 催 glibc 归还空闲堆给内核。
+
+    这三层是 Python GC 管不到的内存：
+      1) pymupdf.TOOLS.store_shrink(100) —— 清空 MuPDF 全局 store（字体/图形缓存）
+      2) gc.collect() —— 回收可能存在的 Python 循环引用
+      3) libc.malloc_trim(0) —— 让 glibc 把空闲的物理页真正还给操作系统（Linux 生效，
+         macOS/musl 上 _get_libc() 为 None，自动跳过）
+    全部包在 try 里，任何一步失败都不影响主流程。
+    """
+    try:
+        pymupdf.TOOLS.store_shrink(100)
+    except Exception:
+        pass
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    libc = _get_libc()
+    if libc is not None:
+        try:
+            libc.malloc_trim(0)
         except Exception:
             pass
 
@@ -350,6 +401,8 @@ def get_doc_meta(entry):
                 pages.append({"w": round(r.width, 1), "h": round(r.height, 1)})
             except Exception:
                 pages.append({"w": 612.0, "h": 792.0})
+    # PDF 已关闭，回收 C 层内存
+    reclaim_c_memory()
     return {"pageCount": cnt, "pages": pages}
 
 
@@ -359,17 +412,21 @@ def extract_page_pdf(entry: dict, page: int, size: int = 1):
     _t_req = time.time()
     if page < 0:
         return None
-    with pymupdf.open(entry['path']) as pdf:
-        cnt = pdf.page_count
-        if page > cnt:
-            return None
-        with pymupdf.open() as doc:
-            try:
-                doc.insert_pdf(pdf, from_page=page, to_page=min(page + size - 1, cnt - 1))
-                doc.subset_fonts()
-                return doc.tobytes(garbage=4, deflate=True, deflate_fonts=True)
-            except Exception:
+    try:
+        with pymupdf.open(entry['path']) as pdf:
+            cnt = pdf.page_count
+            if page > cnt:
                 return None
+            with pymupdf.open() as doc:
+                try:
+                    doc.insert_pdf(pdf, from_page=page, to_page=min(page + size - 1, cnt - 1))
+                    doc.subset_fonts()
+                    return doc.tobytes(garbage=4, deflate=True, deflate_fonts=True)
+                except Exception:
+                    return None
+    finally:
+        # 两个 PDF 均已关闭，回收 C 层内存
+        reclaim_c_memory()
 
 
 # ----------------------------------------------------------------------------
@@ -524,48 +581,52 @@ def render_page(entry, page: int, dpi: int):
         except (OSError, ValueError):
             pass
 
-    with pymupdf.open(entry['path']) as pdf:
-        cnt = pdf.page_count
-        if page > cnt:
-            return None
-        png_bytes = pdf[page].get_pixmap(
-            dpi=dpi,
-            alpha=False,
-            colorspace=pymupdf.csRGB,
-        ).tobytes("png")
-
-    # 应用纯Python优化
     try:
+        with pymupdf.open(entry['path']) as pdf:
+            cnt = pdf.page_count
+            if page > cnt:
+                return None
+            png_bytes = pdf[page].get_pixmap(
+                dpi=dpi,
+                alpha=False,
+                colorspace=pymupdf.csRGB,
+            ).tobytes("png")
+
+        # 应用纯Python优化
         try:
-            # 使用智能优化
-            img = Image.open(io.BytesIO(png_bytes))
-            # --- PNG 量化压缩 ---
-            if img.mode in ("RGBA", "LA"):
-                alpha = img.getchannel("A")
-                p_img = img.convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=192)
-                p_img.putalpha(alpha)
-            else:
-                p_img = img.convert("P", palette=Image.ADAPTIVE, colors=192)
+            try:
+                # 使用智能优化
+                img = Image.open(io.BytesIO(png_bytes))
+                # --- PNG 量化压缩 ---
+                if img.mode in ("RGBA", "LA"):
+                    alpha = img.getchannel("A")
+                    p_img = img.convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=192)
+                    p_img.putalpha(alpha)
+                else:
+                    p_img = img.convert("P", palette=Image.ADAPTIVE, colors=192)
 
-            png_buf = io.BytesIO()
-            p_img.save(png_buf, "PNG", optimize=True)
-            png_bytes = png_buf.getvalue()
-        except ImportError:
-            # 如果优化模块不可用，使用原始PNG
-            log(f"页面{page}: 优化模块不可用，使用原始PNG")
-    except Exception as e:
-        # 任何异常都回退到原始PNG
-        log(f"页面{page}优化异常: {e}")
+                png_buf = io.BytesIO()
+                p_img.save(png_buf, "PNG", optimize=True)
+                png_bytes = png_buf.getvalue()
+            except ImportError:
+                # 如果优化模块不可用，使用原始PNG
+                log(f"页面{page}: 优化模块不可用，使用原始PNG")
+        except Exception as e:
+            # 任何异常都回退到原始PNG
+            log(f"页面{page}优化异常: {e}")
 
-    # 缓存优化后的图片
-    try:
-        os.makedirs(os.path.join(DATA_DIR, "image"), exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(png_bytes)
-    except (OSError, ValueError) as e:
-        log(f"缓存写入失败: {e}")
+        # 缓存优化后的图片
+        try:
+            os.makedirs(os.path.join(DATA_DIR, "image"), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(png_bytes)
+        except (OSError, ValueError) as e:
+            log(f"缓存写入失败: {e}")
 
-    return png_bytes
+        return png_bytes
+    finally:
+        # PDF 已关闭、pixmap/Pillow 中间对象已出作用域，回收 C 层内存
+        reclaim_c_memory()
 
 
 @app.route(f"{GATEWAY_PREFIX}/api/page", methods=["GET"])
