@@ -1,19 +1,15 @@
 # Cargo 依赖源配置（随仓库走）
-# 目的：飞牛 NAS 本机 cargo 1.65.0 —— 既连不上 github(crates.io-index)，
-#       又不支持 sparse 协议(需 >=1.70)，git 镜像(rsproxy)也已下线。
-# 解决：依赖源码已用 `cargo vendor` 全量打包进 rustservice/vendor/ 并提交 git，
-#       编译时完全离线、不碰任何 registry、不受 cargo 版本影响。
-#
-# 重新生成 vendor（本地能联网时）：
-#   cd rustservice && cargo vendor --locked vendor
-# 如需换回联网官方源：把下面 replace-with 注释掉即可。
+# 用途：把 crates.io 索引与下载源换成 rsproxy.cn 的 sparse 镜像，
+#       解决部分环境连不上 github(crates.io-index) 的问题。
+# 要求：cargo >= 1.70（支持 sparse 协议）。目标机 cargo 1.97 满足。
+# 如需换回官方源：把下面 replace-with 注释掉即可。
 
 [source.crates-io]
-replace-with = "vendored-sources"
+replace-with = "rsproxy-sparse"
 
-[source.vendored-sources]
-directory = "vendor"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
 
-# 用系统 git/curl 走网络（vendor 模式下基本用不到，保留以防万一）
+# 用系统 git/curl 走网络（复用系统证书，避免个别 SSL 兼容问题）
 [net]
 git-fetch-with-cli = true

@@ -183,18 +183,17 @@ ensure_rust_toolchain
 
 cd "$RUST_DIR"
 
-# 依赖已 vendor 进 rustservice/vendor/ 并配 .cargo/config.toml，
-# 全程离线编译：--offline 不联网、--locked 锁定 Cargo.lock，NAS 断网也能编。
-OFFLINE_FLAGS="--offline --locked"
+# 依赖走 .cargo/config.toml 里的 rsproxy sparse 镜像联网拉取，
+# 首次编译由 cargo 自动生成 Cargo.lock（未提交进 git，交由编译端生成）。
 if [ "$NATIVE" = "1" ]; then
     # 原生编译，不指定 target
-    "$CARGO" build ${CARGO_PROFILE_FLAG} ${OFFLINE_FLAGS}
+    "$CARGO" build ${CARGO_PROFILE_FLAG}
     BIN_OUT="$RUST_DIR/target/${CARGO_PROFILE_DIR}/pdfserver"
 elif [ "$BUILD_MODE" = "zigbuild" ]; then
-    "$CARGO" zigbuild ${CARGO_PROFILE_FLAG} ${OFFLINE_FLAGS} --target "${RUST_TARGET}"
+    "$CARGO" zigbuild ${CARGO_PROFILE_FLAG} --target "${RUST_TARGET}"
     BIN_OUT="$RUST_DIR/target/${RUST_TARGET}/${CARGO_PROFILE_DIR}/pdfserver"
 else
-    cross build ${CARGO_PROFILE_FLAG} ${OFFLINE_FLAGS} --target "${RUST_TARGET}"
+    cross build ${CARGO_PROFILE_FLAG} --target "${RUST_TARGET}"
     BIN_OUT="$RUST_DIR/target/${RUST_TARGET}/${CARGO_PROFILE_DIR}/pdfserver"
 fi
 
