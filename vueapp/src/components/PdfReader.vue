@@ -25,17 +25,14 @@
               height: page.displayHeight + 'px',
             }"
         >
-          <!-- 图片：只有 src 被赋值后才真正请求 -->
-          <img
-              v-if="page.src"
-              :src="page.src"
-              :alt="'第' + (page.pageNum + 1) + '页'"
-              class="page-img"
-              @load="onImageLoad(page.pageNum)"
-              @error="onImageError(page.pageNum)"
+          <!-- canvas：pdf.js 矢量渲染，只有进入可视范围才真正下载切片并渲染 -->
+          <canvas
+              v-show="page.rendered"
+              :ref="el => setCanvasRef(page.pageNum, el)"
+              class="page-canvas"
           />
           <!-- 占位/加载/失败 -->
-          <div v-if="!page.loaded && !page.error" class="ph-overlay">
+          <div v-if="!page.rendered && !page.error" class="ph-overlay">
             <div class="ph-icon">
               <svg viewBox="0 0 24 24" fill="none">
                 <path d="M6 2h8l4 4v16H6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
@@ -43,7 +40,7 @@
               </svg>
             </div>
             <div class="ph-text">
-              {{ page.src ? `加载中 ${page.pageNum + 1}...` : `第 ${page.pageNum + 1} 页` }}
+              {{ page.loading ? `加载中 ${page.pageNum + 1}...` : `第 ${page.pageNum + 1} 页` }}
             </div>
           </div>
           <div v-if="page.error" class="err-overlay" @click="retryPage(page.pageNum)">
@@ -61,8 +58,14 @@
 <script setup lang="ts">
 import {ref, onMounted, onUnmounted, computed, reactive, nextTick} from 'vue'
 import {useRoute, useRouter} from 'vue-router'
-import {request} from '@/utils/request'
+import {request, download} from '@/utils/request'
 import {debounce} from '@/utils/UIUtils'
+import * as pdfjsLib from 'pdfjs-dist'
+// @ts-ignore vite worker 导入
+import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker'
+
+// pdf.js worker：用 Vite 的 ?worker 方式打包，随应用发布，不依赖外网 CDN
+pdfjsLib.GlobalWorkerOptions.workerPort = new PdfWorker()
 
 const route = useRoute()
 const router = useRouter()
@@ -85,14 +88,15 @@ const scale = ref(1)
 const zoomLabel = computed(() => `${Math.round(scale.value * 100)}%`)
 
 // ============ 常量配置 ============
-const DPI = 300              // 图片渲染 DPI
 const MAX_CONCURRENT = 3     // 最大并发加载数
 const PRELOAD_AHEAD = 2      // 向下预加载页数
 const PRELOAD_BEHIND = 1     // 向上预加载页数
 const OBSERVER_ROOT_MARGIN = '400px 0px' // 提前触发加载的缓冲距离
 const DEFAULT_PAGE_WIDTH = 595   // A4 默认宽（pt）
 const DEFAULT_PAGE_HEIGHT = 842  // A4 默认高（pt）
-const VIEWPORT_WIDTH_LIMIT = 900 // 图片显示的最大宽度（保持阅读舒适）
+const VIEWPORT_WIDTH_LIMIT = 900 // 页面显示的最大宽度（保持阅读舒适）
+// canvas 渲染上限，避免高分屏 devicePixelRatio 过大导致内存暴涨
+const MAX_DPR = 2
 
 // ============ 页面数据 ============
 interface PageItem {
@@ -100,33 +104,42 @@ interface PageItem {
   // 原始 pt 尺寸（来自 meta）
   origWidth: number
   origHeight: number
-  // 当前显示尺寸（受 scale 影响）
+  // 当前显示尺寸（受 scale 影响，CSS 像素）
   displayWidth: number
   displayHeight: number
-  // 图片 src（未加载时为空）
-  src: string
-  loaded: boolean
+  loading: boolean   // 正在下载/渲染
+  rendered: boolean  // 已渲染到 canvas
   error: boolean
 }
 
 const pages = reactive<PageItem[]>([])
 
-// ============ 并发调度器 ============
-class ImageLoader {
+// canvas 元素引用（pageNum -> HTMLCanvasElement）
+const canvasEls = new Map<number, HTMLCanvasElement>()
+// 每页缓存的 pdf.js 文档代理（用于缩放时按新 viewport 重绘，不必重新下载）
+const pageDocs = new Map<number, any>()
+// 每页对应的 AbortController（用于取消下载）
+const pageAborts = new Map<number, AbortController>()
+
+function setCanvasRef(pageNum: number, el: any) {
+  if (el) canvasEls.set(pageNum, el as HTMLCanvasElement)
+  else canvasEls.delete(pageNum)
+}
+
+// ============ 并发调度器（下载切片 + pdf.js 渲染）============
+class PageLoader {
   private queue: number[] = []          // 待加载的 pageNum 队列（按优先级）
   private running = new Set<number>()   // 正在加载的 pageNum
   private aborted = new Set<number>()   // 已被跳过的 pageNum
 
-  // 请求加载某一页；priority=true 会插到队首
   request(pageNum: number, priority = false) {
     if (pageNum < 0 || pageNum >= pages.length) return
     const p = pages[pageNum]
-    if (!p || p.src || p.loaded) return
+    if (!p || p.rendered || p.loading) return
     if (this.running.has(pageNum)) return
 
     this.aborted.delete(pageNum)
 
-    // 已在队列
     const idx = this.queue.indexOf(pageNum)
     if (idx >= 0) {
       if (priority) {
@@ -135,14 +148,11 @@ class ImageLoader {
       }
       return
     }
-
     if (priority) this.queue.unshift(pageNum)
     else this.queue.push(pageNum)
-
     this.tick()
   }
 
-  // 取消尚未开始的请求（滚动出可视范围时清理低优先级任务）
   cancel(pageNum: number) {
     const idx = this.queue.indexOf(pageNum)
     if (idx >= 0) {
@@ -151,7 +161,6 @@ class ImageLoader {
     }
   }
 
-  // 只保留在候选集合内的排队任务，其他的取消掉
   keepOnly(keepSet: Set<number>) {
     this.queue = this.queue.filter(pn => {
       if (keepSet.has(pn)) return true
@@ -165,13 +174,13 @@ class ImageLoader {
       const pageNum = this.queue.shift()!
       if (this.aborted.has(pageNum)) continue
       const p = pages[pageNum]
-      if (!p || p.loaded || p.src) continue
+      if (!p || p.rendered || p.loading) continue
 
       this.running.add(pageNum)
-      // 直接给 img.src 赋值，交给浏览器加载
-      // 加时间戳？不需要，浏览器缓存对同 URL 有利
-      p.src = buildPageUrl(pageNum)
-      // 注意：加载完成/失败会通过 @load / @error 回调 markDone / markError
+      p.loading = true
+      loadAndRender(pageNum)
+        .then(() => this.markDone(pageNum))
+        .catch(() => this.markError(pageNum))
     }
   }
 
@@ -192,40 +201,105 @@ class ImageLoader {
   }
 }
 
-const loader = new ImageLoader()
+const loader = new PageLoader()
 
 // ============ URL 构建 ============
 function buildPageUrl(pageNum: number): string {
-  // 使用 request 实例的 baseURL：/app/fnnas-pdfreader/api/
-  // 这里直接构造完整路径给浏览器加载，避免走 axios（浏览器原生处理更快）
-  const base = (request.defaults.baseURL || '').replace(/\/+$/, '/')
-  // pageNum 后端从 0 开始
-  return `${base}page?id=${encodeURIComponent(bookId.value)}&page=${pageNum}&dpi=${DPI}`
+  // 走 request 的 baseURL（相对路径），交给并发下载调度器
+  // 页码对外统一 0-based（第一页 = 0），与 Rust 服务端约定一致
+  return `pagepdf?id=${encodeURIComponent(bookId.value)}&page=${pageNum}`
 }
 
-// ============ 图片回调 ============
-function onImageLoad(pageNum: number) {
+// ============ 下载切片 + pdf.js 渲染 ============
+async function loadAndRender(pageNum: number): Promise<void> {
   const p = pages[pageNum]
   if (!p) return
-  p.loaded = true
+
+  // 1) 下载单页 PDF 切片（ArrayBuffer），复用 request.ts 的并发下载调度器
+  const ac = new AbortController()
+  pageAborts.set(pageNum, ac)
+  let buf: ArrayBuffer
+  try {
+    buf = await download(buildPageUrl(pageNum), ac.signal)
+  } finally {
+    pageAborts.delete(pageNum)
+  }
+
+  // 2) pdf.js 解析（切片只有 1 页，取第 1 页）
+  // 复制一份，避免 pdf.js 持有可能被复用的 buffer
+  const data = buf.slice(0)
+  const doc = await pdfjsLib.getDocument({data, disableAutoFetch: true, disableStream: true}).promise
+  pageDocs.set(pageNum, doc)
+
+  // 3) 渲染到 canvas
+  await renderPageCanvas(pageNum)
+
+  p.loading = false
   p.error = false
-  loader.markDone(pageNum)
+  p.rendered = true
 }
 
-function onImageError(pageNum: number) {
+// 把某页按当前 scale 渲染/重绘到它的 canvas
+async function renderPageCanvas(pageNum: number): Promise<void> {
+  const doc = pageDocs.get(pageNum)
+  const canvas = canvasEls.get(pageNum)
+  const p = pages[pageNum]
+  if (!doc || !canvas || !p) return
+
+  const pdfPage = await doc.getPage(1)
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR)
+  // displayWidth 为 CSS 像素，viewport scale = (显示宽 / PDF 点宽) × dpr
+  const cssWidth = p.displayWidth
+  const baseViewport = pdfPage.getViewport({scale: 1})
+  const renderScale = (cssWidth / baseViewport.width) * dpr
+  const viewport = pdfPage.getViewport({scale: renderScale})
+
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  canvas.width = Math.floor(viewport.width)
+  canvas.height = Math.floor(viewport.height)
+  canvas.style.width = '100%'
+  canvas.style.height = '100%'
+
+  await pdfPage.render({canvasContext: ctx, viewport}).promise
+  // 释放该 page 的中间对象（保留 doc，供缩放重绘）
+  pdfPage.cleanup()
+}
+
+// ============ 回收：滚出视区的页销毁 canvas 内容 + pdf.js 文档 ============
+function recyclePage(pageNum: number) {
   const p = pages[pageNum]
   if (!p) return
-  p.error = true
-  p.loaded = false
-  p.src = ''
-  loader.markError(pageNum)
+  // 取消尚在下载的请求
+  const ac = pageAborts.get(pageNum)
+  if (ac) {
+    ac.abort()
+    pageAborts.delete(pageNum)
+  }
+  // 销毁 pdf.js 文档，释放内存
+  const doc = pageDocs.get(pageNum)
+  if (doc) {
+    try { doc.destroy() } catch { /* ignore */ }
+    pageDocs.delete(pageNum)
+  }
+  // 清空 canvas 位图
+  const canvas = canvasEls.get(pageNum)
+  if (canvas) {
+    canvas.width = 0
+    canvas.height = 0
+  }
+  p.rendered = false
+  p.loading = false
+  p.error = false
 }
 
+// ============ 回调 ============
 function retryPage(pageNum: number) {
   const p = pages[pageNum]
   if (!p) return
   p.error = false
-  p.src = ''
+  p.rendered = false
+  p.loading = false
   loader.request(pageNum, true)
 }
 
@@ -235,14 +309,11 @@ let io: IntersectionObserver | null = null
 function setupObserver() {
   if (!viewportRef.value) return
   io = new IntersectionObserver((entries) => {
-    // 收集当前可见的页码
     for (const entry of entries) {
       const pn = parseInt((entry.target as HTMLElement).dataset.pageNum || '-1', 10)
       if (pn < 0) continue
       if (entry.isIntersecting) {
-        // 可见 -> 高优先级加载
         loader.request(pn, true)
-        // 顺带预加载前后 N 页
         for (let k = 1; k <= PRELOAD_AHEAD; k++) loader.request(pn + k, false)
         for (let k = 1; k <= PRELOAD_BEHIND; k++) loader.request(pn - k, false)
       }
@@ -252,8 +323,6 @@ function setupObserver() {
     rootMargin: OBSERVER_ROOT_MARGIN,
     threshold: 0.01,
   })
-
-  // 监听所有页面元素
   const els = viewportRef.value.querySelectorAll('.image-page')
   els.forEach(el => io!.observe(el))
 }
@@ -267,7 +336,6 @@ function teardownObserver() {
 
 // ============ 尺寸计算 ============
 function computeDisplaySize(p: PageItem) {
-  // 页面按容器宽度自适应，同时限制最大宽，再乘以 scale
   const vw = Math.min(
       (viewportRef.value?.clientWidth || 800) - 24,
       VIEWPORT_WIDTH_LIMIT
@@ -294,14 +362,11 @@ function updateCurrentPageFromScroll() {
   const scrollTop = vp.scrollTop
   const viewCenter = scrollTop + vp.clientHeight / 2
 
-  // 查找当前视口中心所在的页
   let acc = 0
   for (let i = 0; i < pages.length; i++) {
     const h = pages[i].displayHeight + 20 // 20 = margin-bottom
     if (viewCenter >= acc && viewCenter < acc + h) {
       currentPage.value = i
-      // frac = 视口中心在「本页(含下边距)」内的相对比例(0~1)，与设备/缩放无关。
-      // 持续保存(不只在换页时)，保证同一页内的滚动位置也能被记录并跨端恢复。
       const inPageFrac = Math.min(1, Math.max(0, (viewCenter - acc) / h))
       saveProgress(i, inPageFrac)
       return
@@ -310,14 +375,13 @@ function updateCurrentPageFromScroll() {
   }
 }
 
-// 快速滚动时，取消远离视口的排队任务
+// 快速滚动时，取消/回收远离视口的页
 const scheduleCancelInvisible = debounce(() => {
   const vp = viewportRef.value
   if (!vp) return
   const scrollTop = vp.scrollTop
   const viewBottom = scrollTop + vp.clientHeight
 
-  // 计算可视附近范围（含预加载缓冲）
   const keep = new Set<number>()
   let acc = 0
   const buffer = vp.clientHeight * 2 // 上下2屏范围内保留
@@ -331,6 +395,12 @@ const scheduleCancelInvisible = debounce(() => {
     acc += h
   }
   loader.keepOnly(keep)
+  // 回收保留范围之外、已渲染的页，释放 pdf.js 内存（手机端翻几十页不 OOM）
+  for (const p of pages) {
+    if (!keep.has(p.pageNum) && (p.rendered || pageDocs.has(p.pageNum))) {
+      recyclePage(p.pageNum)
+    }
+  }
 }, 200)
 
 // ============ 进度保存 ============
@@ -359,10 +429,8 @@ async function loadMeta() {
     total.value = data.pageCount || 0
     bookName.value = data.name || ''
     currentPage.value = data.progress?.page || 0
-    // 页内比例：兼容旧记录(可能无 frac 字段)
     startFrac.value = typeof data.progress?.frac === 'number' ? data.progress.frac : 0
 
-    // 初始化 pages 数组
     pages.length = 0
     const metaPages: Array<{ w: number; h: number }> = data.pages || []
     for (let i = 0; i < total.value; i++) {
@@ -373,8 +441,8 @@ async function loadMeta() {
         origHeight: size?.h || DEFAULT_PAGE_HEIGHT,
         displayWidth: 0,
         displayHeight: 0,
-        src: '',
-        loaded: false,
+        loading: false,
+        rendered: false,
         error: false,
       }
       computeDisplaySize(item)
@@ -388,18 +456,13 @@ async function loadMeta() {
     })
 
     await nextTick()
-
-    // 挂载 IntersectionObserver
     setupObserver()
-
-    // 滚动到起始页 + 页内比例，精确恢复上次阅读位置
     scrollToPage(currentPage.value, startFrac.value)
   } catch (e) {
     console.error('加载文档元数据失败', e)
   }
 }
 
-// 滚动到指定页；frac 为该页(含下边距)内的相对位置(0~1)
 function scrollToPage(pageNum: number, frac = 0) {
   const vp = viewportRef.value
   if (!vp) return
@@ -407,14 +470,19 @@ function scrollToPage(pageNum: number, frac = 0) {
   for (let i = 0; i < pageNum && i < pages.length; i++) {
     top += pages[i].displayHeight + 20
   }
-  // 叠加页内比例：让视口中心落在「本页顶部 + frac × 本页高度」处
   const h = (pages[pageNum]?.displayHeight || 0) + 20
   top += h * frac - vp.clientHeight / 2
   vp.scrollTop = Math.max(0, top)
 }
 
 // ============ 缩放 ============
-// 缩放时保持锚点位置：可传入视口内的锚点 y（默认视口中心），缩放后该点尽量停在原处
+// 重绘节流：缩放停止后再按新 scale 重渲染可视页 canvas（矢量始终清晰）
+const rerenderVisible = debounce(() => {
+  for (const [pageNum] of pageDocs) {
+    renderPageCanvas(pageNum).catch(() => { /* ignore */ })
+  }
+}, 200)
+
 function applyZoom(newScale: number, anchorClientY?: number) {
   newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, newScale))
   const vp = viewportRef.value
@@ -424,12 +492,10 @@ function applyZoom(newScale: number, anchorClientY?: number) {
     return
   }
 
-  // 锚点：默认视口垂直中心
   const anchorY = anchorClientY ?? vp.clientHeight / 2
   const scrollTop = vp.scrollTop
   const focus = scrollTop + anchorY
 
-  // 记录锚点相对于所在页顶部的比例
   let acc = 0
   let anchorPage = 0
   let anchorRatio = 0
@@ -443,11 +509,9 @@ function applyZoom(newScale: number, anchorClientY?: number) {
     acc += h
   }
 
-  // 应用新缩放（只改显示尺寸，不重设 img.src，浏览器不会重新请求）
   scale.value = newScale
   recomputeAllSizes()
 
-  // 恢复到原来的相对位置：让锚点页的 anchorRatio 处回到 anchorY
   nextTick(() => {
     let top = 0
     for (let i = 0; i < anchorPage && i < pages.length; i++) {
@@ -456,6 +520,8 @@ function applyZoom(newScale: number, anchorClientY?: number) {
     top += ((pages[anchorPage]?.displayHeight || 0) + 20) * anchorRatio
     vp.scrollTop = Math.max(0, top - anchorY)
   })
+  // 按新 scale 重绘已加载页的 canvas，保证矢量清晰不发虚
+  rerenderVisible()
 }
 
 function zoomIn() {
@@ -468,10 +534,10 @@ function zoomOut() {
   if (prev !== undefined) applyZoom(prev)
 }
 
-// ============ 双指缩放手势（原生 pinch 已被全局 viewport 禁用，这里自己实现）============
-let pinchStartDist = 0     // 双指初始距离
-let pinchStartScale = 1    // 双指开始时的 scale
-let pinchAnchorY = 0       // 双指中点相对视口顶部的 y（缩放锚点）
+// ============ 双指缩放手势 ============
+let pinchStartDist = 0
+let pinchStartScale = 1
+let pinchAnchorY = 0
 let pinching = false
 
 function touchDist(t0: Touch, t1: Touch) {
@@ -487,14 +553,13 @@ function onTouchStart(e: TouchEvent) {
     pinchStartScale = scale.value
     const vp = viewportRef.value
     const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2
-    // 转成相对视口顶部的坐标作为缩放锚点
     pinchAnchorY = vp ? midY - vp.getBoundingClientRect().top : midY
   }
 }
 
 function onTouchMove(e: TouchEvent) {
   if (!pinching || e.touches.length !== 2) return
-  e.preventDefault() // 阻止页面滚动，专注缩放
+  e.preventDefault()
   const dist = touchDist(e.touches[0], e.touches[1])
   if (pinchStartDist <= 0) return
   const target = pinchStartScale * (dist / pinchStartDist)
@@ -528,6 +593,10 @@ onUnmounted(() => {
   }
   teardownObserver()
   loader.clear()
+  // 释放所有 pdf.js 文档
+  for (const [pn] of pageDocs) recyclePage(pn)
+  pageDocs.clear()
+  canvasEls.clear()
   pages.length = 0
 })
 
@@ -598,20 +667,15 @@ function close() {
 .image-viewport {
   flex: 1;
   overflow-y: auto;
-  /* 放大后页面可能宽于视口，开启横向滚动以便左右拖动查看全部内容 */
   overflow-x: auto;
   position: relative;
   background: #f5f5f5;
   padding: 12px 0;
   -webkit-overflow-scrolling: touch;
-  /* 允许双向平移手势（拖动查看放大后的内容） */
   touch-action: pan-x pan-y;
   overscroll-behavior: contain;
 }
 
-/* 内容轨道：宽度取最宽页面(max-content)，且至少撑满视口(min-width:100%)。
-   - 页面宽于视口时：轨道变宽 → 出现横向滚动条，左右两侧均可拖到，不再被裁剪。
-   - 页面窄于视口时：轨道=100% + 居中，页面保持水平居中。 */
 .pages-track {
   display: flex;
   flex-direction: column;
@@ -632,11 +696,10 @@ function close() {
   flex: 0 0 auto;
 }
 
-.page-img {
+.page-canvas {
   width: 100%;
   height: 100%;
   display: block;
-  object-fit: contain;
 }
 
 .ph-overlay {
@@ -674,7 +737,6 @@ function close() {
   cursor: pointer;
 }
 
-/* 页脚页码浮标：桌面端隐藏，手机端顶部工具栏隐藏后作为页码提示 */
 .page-footer {
   display: none;
   position: fixed;
@@ -694,7 +756,6 @@ function close() {
 
 /* ============ 手机端适配 ============ */
 @media (max-width: 640px) {
-  /* 手机端隐藏顶部工具栏，改用双指缩放 + 页脚页码 */
   .reader-toolbar {
     display: none;
   }
