@@ -406,51 +406,21 @@ fn save_progress_entry(
 // PDF 处理（纯 Rust，lopdf 无损抽页）
 // ----------------------------------------------------------------------------
 //
-// 文档缓存（单槽）：一本 47MB 扫描书每次翻页都重新解析约 0.7s；缓存已解析的
-// Document 后，抽页只需 clone + 删页，约几十 ms。只缓存"最近一本"，内存有界
-// （最多常驻一本书的对象图），不会重新引入旧版 PyMuPDF 那种累积不回收的问题。
-struct DocCache {
-    path: String,
-    mtime: i64,
-    doc: PdfDoc,
-}
-static DOC_CACHE: OnceLock<Mutex<Option<DocCache>>> = OnceLock::new();
+// 不做文档缓存：lopdf 解析很快，每次请求直接 PdfDoc::load 打开即可，
+// 无常驻内存、无锁竞争，逻辑最简单。
 
-fn doc_cache() -> &'static Mutex<Option<DocCache>> {
-    DOC_CACHE.get_or_init(|| Mutex::new(None))
-}
-
-fn file_mtime(path: &str) -> i64 {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-// 取一份可修改的 Document：命中缓存则 clone，否则解析并写入缓存
-fn load_doc_cached(path: &str) -> Result<PdfDoc, String> {
-    let mtime = file_mtime(path);
-    {
-        let guard = doc_cache().lock().unwrap();
-        if let Some(c) = guard.as_ref() {
-            if c.path == path && c.mtime == mtime {
-                return Ok(c.doc.clone());
-            }
-        }
-    }
+// 只读打开：解析文档并在闭包里读取（用于 meta 这类纯读操作，无需 clone）
+fn with_doc_cached<F, R>(path: &str, f: F) -> Result<R, String>
+where
+    F: FnOnce(&PdfDoc) -> R,
+{
     let doc = PdfDoc::load(path).map_err(|e| format!("load: {e:?}"))?;
-    let cloned = doc.clone();
-    {
-        let mut guard = doc_cache().lock().unwrap();
-        *guard = Some(DocCache {
-            path: path.to_string(),
-            mtime,
-            doc,
-        });
-    }
-    Ok(cloned)
+    Ok(f(&doc))
+}
+
+// 取一份可修改的 Document（用于抽页等需改写的场景）
+fn load_doc_cached(path: &str) -> Result<PdfDoc, String> {
+    PdfDoc::load(path).map_err(|e| format!("load: {e:?}"))
 }
 
 fn obj_num(o: &PdfObj) -> f64 {
@@ -506,14 +476,15 @@ fn page_dimensions(doc: &PdfDoc, page_id: ObjectId) -> (f64, f64) {
 }
 
 fn get_doc_meta(path: &str) -> Result<(u32, Vec<(f64, f64)>), String> {
-    let doc = load_doc_cached(path)?;
-    let pages = doc.get_pages(); // BTreeMap<页号(1-based), ObjectId>，已按页序排列
-    let cnt = pages.len() as u32;
-    let mut dims = Vec::with_capacity(pages.len());
-    for (_n, id) in &pages {
-        dims.push(page_dimensions(&doc, *id));
-    }
-    Ok((cnt, dims))
+    with_doc_cached(path, |doc| {
+        let pages = doc.get_pages(); // BTreeMap<页号(1-based), ObjectId>，已按页序排列
+        let cnt = pages.len() as u32;
+        let mut dims = Vec::with_capacity(pages.len());
+        for (_n, id) in &pages {
+            dims.push(page_dimensions(doc, *id));
+        }
+        (cnt, dims)
+    })
 }
 
 fn round1(v: f64) -> f64 {
