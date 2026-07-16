@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 tiny_http = "0.12"
 # pdf_oxide：纯 Rust PDF 库（MIT/Apache-2.0），DocumentEditor 抽页返回独立单页文档
-pdf_oxide = "0.3.74"
+pdf_oxide = { version = "0.3", default-features = false, features = ["rendering"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"

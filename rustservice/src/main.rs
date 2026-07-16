@@ -16,7 +16,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use pdf_oxide::PdfDocument;
 use pdf_oxide::editor::DocumentEditor;
 
 use serde::{Deserialize, Serialize};
@@ -416,55 +415,190 @@ fn round1(v: f64) -> f64 {
 
 // 读元数据：页数 + 每页 (宽,高)。宽高由 get_page_media_box 计算得到
 // （旋转 90/270 时交换宽高以匹配前端显示方向）。
+// meta 结果缓存：path -> (mtime, page_count, dims)。
+// meta 的输出（页数+每页尺寸）只随文件内容变化，同一本书算一次即可，
+// 之后按 mtime 命中秒回，省掉每次遍历数百页读 MediaBox 的开销。
+static META_CACHE: OnceLock<Mutex<BTreeMap<String, (i64, u32, Vec<(f64, f64)>)>>> = OnceLock::new();
+
+fn meta_cache() -> &'static Mutex<BTreeMap<String, (i64, u32, Vec<(f64, f64)>)>> {
+    META_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+// 读取文档元信息（总页数 + 每页尺寸）。
+// 两层优化：
+//   1) 结果缓存（META_CACHE，按 mtime 失效）——算一次后直接秒回，不再遍历所有页。
+//   2) 首次计算时复用抽页那份共享 DocumentEditor（DOC_CACHE），而不是再
+//      PdfDocument::open 整本 88MB——避免同一本书被 open 两遍、各占 ~182MB。
 fn get_doc_meta(path: &str) -> Result<(u32, Vec<(f64, f64)>), String> {
-    let t0 = std::time::Instant::now();
-    let doc = PdfDocument::open(path).map_err(|e| format!("open: {e:?}"))?;
-    let t_open = t0.elapsed();
-    let cnt = doc.page_count().map_err(|e| format!("page_count: {e:?}"))? as u32;
-    let t_count = t0.elapsed();
-    let mut dims = Vec::with_capacity(cnt as usize);
-    for i in 0..cnt as usize {
-        // MediaBox: (x0, y0, x1, y1)，用户空间单位
-        let (x0, y0, x1, y1) = doc
-            .get_page_media_box(i)
-            .map_err(|e| format!("media_box {i}: {e:?}"))?;
-        let mut w = (x1 - x0).abs() as f64;
-        let mut h = (y1 - y0).abs() as f64;
-        let rot = doc.get_page_rotation(i).unwrap_or(0).rem_euclid(360);
-        if rot == 90 || rot == 270 {
-            std::mem::swap(&mut w, &mut h);
+    let mtime = file_mtime(path);
+    // 1) 结果缓存命中：秒回。
+    {
+        let cache = meta_cache().lock().unwrap();
+        if let Some((m, cnt, dims)) = cache.get(path) {
+            if *m == mtime {
+                return Ok((*cnt, dims.clone()));
+            }
         }
-        dims.push((round1(w), round1(h)));
     }
+    let t0 = std::time::Instant::now();
+    // 2) 复用共享 editor（首次 open 后 meta/pagepdf 共享同一份内存）。
+    let cached = get_cached_doc(path)?;
+    let t_open = t0.elapsed();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut guard = cached.lock().unwrap();
+        let ed = &mut guard.editor;
+        let cnt = ed.current_page_count() as u32;
+        let mut dims = Vec::with_capacity(cnt as usize);
+        for i in 0..cnt as usize {
+            // MediaBox: [x0, y0, x1, y1]，用户空间单位
+            let bx = ed
+                .get_page_media_box(i)
+                .map_err(|e| format!("media_box {i}: {e:?}"))?;
+            let mut w = (bx[2] - bx[0]).abs() as f64;
+            let mut h = (bx[3] - bx[1]).abs() as f64;
+            let rot = ed.get_page_rotation(i).unwrap_or(0).rem_euclid(360);
+            if rot == 90 || rot == 270 {
+                std::mem::swap(&mut w, &mut h);
+            }
+            dims.push((round1(w), round1(h)));
+        }
+        Ok::<(u32, Vec<(f64, f64)>), String>((cnt, dims))
+    }));
+    let (cnt, dims) = match result {
+        Ok(r) => r?,
+        Err(_) => return Err("pdf_oxide panic while reading meta".to_string()),
+    };
     let t_dims = t0.elapsed();
     log(&format!(
-        "meta 计时 [{}]: open={:?} page_count={:?}(+{:?}) dims={:?}(+{:?}) 共{}页",
+        "meta 计时 [{}]: 取缓存editor={:?} dims={:?}(+{:?}) 共{}页 (首次，已写入结果缓存)",
         path,
         t_open,
-        t_count,
-        t_count - t_open,
         t_dims,
-        t_dims - t_count,
+        t_dims - t_open,
         cnt
     ));
+    // 写入结果缓存。
+    meta_cache()
+        .lock()
+        .unwrap()
+        .insert(path.to_string(), (mtime, cnt, dims.clone()));
     Ok((cnt, dims))
 }
 
-// 抽第 page 页（0-based）成独立单页 PDF，返回 bytes。
-// 用 pdf_oxide 的 DocumentEditor::extract_pages_to_bytes：真正提取页面（保留内容/字体/图像），
-// 不修改原文档，直接返回只含该页的独立 PDF 字节。
+// ----------------------------------------------------------------------------
+// 抽页：文档级缓存 + 并发信号量（本地基准测试驱动的设计）
+// ----------------------------------------------------------------------------
 //
-// 关键：pdf_oxide 对某些页可能内部 panic（unwrap/越界等）而非返回 Err。若不拦截，
-// panic 会沿调用栈冒泡到 worker 的 catch_unwind——那时请求已未响应就被 drop，
-// 网关拿到裸断连接返回 502。这里用 catch_unwind 把 panic 转成 Err，
-// 保证路由层总能回一个正常的 HTTP 错误响应（服务不崩、无 502）。
-// 直接在 worker 线程内进程内执行，不再 fork 子进程（子进程每次独立 open 整本文件、
-// 零共享，高并发下内存 N 倍放大反而更容易 OOM）。
+// 【为什么需要缓存】本地实测（88MB / 383 页大书，release）：
+//   - 单页抽取仅 0.02s，串行时进程峰值 RSS 稳定在 ~182MB（= 一次 open 把整本
+//     文件读进内存 + 解析缓存）。
+//   - 但 `DocumentEditor::open` = `std::fs::read` 整本文件；若每个 pagepdf 请求
+//     都独立 open，8 个后端 worker 并发时峰值 RSS 线性叠成 ~1.4GB（实测 1419MB），
+//     NAS 内存有限 → 内核 OOM-kill → 服务重启 → 后续请求瞬间 502。
+//   - 这就是 NAS 上「前 2 个请求各卡 ~9.5s 后 502、其余 173ms 502」的真凶：
+//     不是单页慢，是并发下内存耗尽拖垮整个进程。
+//
+// 【修法】同一本书只 open 一次，缓存 DocumentEditor（按 mtime 失效），所有并发
+//   请求共享那一份 ~182MB。pdf_oxide 的 extract_pages_to_bytes 抽完会把内部
+//   page_order/modified_objects 完全还原（源码 1195-1207「Always restore」），
+//   editor 状态不变，故可安全复用抽任意页而不串页。缓存命中后不再重复 fs::read，
+//   峰值内存 = 打开的书本数 × 182MB，与并发数解耦。
+//
+// 【并发信号量】再加一道保险：同时最多 MAX_EXTRACT 个抽页在跑。即便前端狂发、
+//   或同时打开多本大书，也不会让内存无上限膨胀。
+
+// 单本书的缓存条目：mtime 用于失效；editor 用 Mutex 串行化（extract 是 &mut self）。
+struct CachedDoc {
+    mtime: i64,
+    editor: DocumentEditor,
+}
+
+// path -> 缓存条目。外层 Mutex 只在“取/换条目”时短暂持有，不覆盖抽页耗时。
+static DOC_CACHE: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<CachedDoc>>>>> = OnceLock::new();
+// 抽页并发闸门：用一个「许可数」计数信号量控制同时抽页数。
+static EXTRACT_GATE: OnceLock<(Mutex<usize>, std::sync::Condvar)> = OnceLock::new();
+const MAX_EXTRACT: usize = 3;
+
+fn doc_cache() -> &'static Mutex<BTreeMap<String, Arc<Mutex<CachedDoc>>>> {
+    DOC_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn extract_gate() -> &'static (Mutex<usize>, std::sync::Condvar) {
+    EXTRACT_GATE.get_or_init(|| (Mutex::new(0), std::sync::Condvar::new()))
+}
+
+// RAII 许可：构造时占用一个抽页名额（不够就等），析构时归还并唤醒等待者。
+struct ExtractPermit;
+impl ExtractPermit {
+    fn acquire() -> Self {
+        let (lock, cv) = extract_gate();
+        let mut n = lock.lock().unwrap();
+        while *n >= MAX_EXTRACT {
+            n = cv.wait(n).unwrap();
+        }
+        *n += 1;
+        ExtractPermit
+    }
+}
+impl Drop for ExtractPermit {
+    fn drop(&mut self) {
+        let (lock, cv) = extract_gate();
+        let mut n = lock.lock().unwrap();
+        *n = n.saturating_sub(1);
+        cv.notify_one();
+    }
+}
+
+fn file_mtime(path: &str) -> i64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// 取（或打开并缓存）某本书的 DocumentEditor。返回内层 Arc<Mutex<CachedDoc>>，
+// 抽页时只锁这一本，不阻塞其他书。
+fn get_cached_doc(path: &str) -> Result<Arc<Mutex<CachedDoc>>, String> {
+    let mtime = file_mtime(path);
+    {
+        let map = doc_cache().lock().unwrap();
+        if let Some(entry) = map.get(path) {
+            // 命中且未过期：直接复用（不重新 fs::read）。
+            if entry.lock().unwrap().mtime == mtime {
+                return Ok(entry.clone());
+            }
+        }
+    }
+    // 未命中或已过期：open 一次（可能内部 panic，用 catch_unwind 兜住）。
+    let path_owned = path.to_string();
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        DocumentEditor::open(&path_owned).map_err(|e| format!("open: {e:?}"))
+    }))
+    .map_err(|_| "pdf_oxide panic on open".to_string())??;
+    let entry = Arc::new(Mutex::new(CachedDoc { mtime, editor: opened }));
+    doc_cache()
+        .lock()
+        .unwrap()
+        .insert(path.to_string(), entry.clone());
+    Ok(entry)
+}
+
+// 抽第 page 页（0-based）成独立单页 PDF，返回 bytes。
+// 复用缓存的 DocumentEditor（多请求共享同一份内存），并受并发信号量限制。
+//
+// catch_unwind：pdf_oxide 对某些页可能内部 panic（unwrap/越界等）而非返回 Err。
+// 若不拦截，panic 冒泡到 worker 的 catch_unwind 时请求已被 drop、未响应，
+// 网关拿到裸断连接返回 502。这里把 panic 转成 Err，保证总能回正常 HTTP 响应。
 fn extract_page_pdf(path: &str, page: usize) -> Result<Vec<u8>, String> {
-    let path = path.to_string();
+    // 先过并发闸门：同时最多 MAX_EXTRACT 个抽页，防止内存无上限膨胀。
+    let _permit = ExtractPermit::acquire();
+    let cached = get_cached_doc(path)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut editor = DocumentEditor::open(&path).map_err(|e| format!("open: {e:?}"))?;
-        editor
+        let mut guard = cached.lock().unwrap();
+        guard
+            .editor
             .extract_pages_to_bytes(&[page])
             .map_err(|e| format!("extract_pages_to_bytes: {e:?}"))
     }));
