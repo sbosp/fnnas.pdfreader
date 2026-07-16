@@ -16,8 +16,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use pdf_oxide::editor::DocumentEditor;
 use pdf_oxide::PdfDocument;
+use pdf_oxide::editor::DocumentEditor;
+
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tiny_http::{Header, Method, Response, Server};
@@ -457,6 +458,8 @@ fn get_doc_meta(path: &str) -> Result<(u32, Vec<(f64, f64)>), String> {
 // panic 会沿调用栈冒泡到 worker 的 catch_unwind——那时请求已未响应就被 drop，
 // 网关拿到裸断连接返回 502。这里用 catch_unwind 把 panic 转成 Err，
 // 保证路由层总能回一个正常的 HTTP 错误响应（服务不崩、无 502）。
+// 直接在 worker 线程内进程内执行，不再 fork 子进程（子进程每次独立 open 整本文件、
+// 零共享，高并发下内存 N 倍放大反而更容易 OOM）。
 fn extract_page_pdf(path: &str, page: usize) -> Result<Vec<u8>, String> {
     let path = path.to_string();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -879,10 +882,11 @@ fn serve_file(request: tiny_http::Request, path: &Path, mime: &str) {
 fn main() {
     init_config();
 
+    let argv: Vec<String> = std::env::args().collect();
+
     // 解析 --port（TCP 调试模式）
     let mut port: u16 = 0;
     let mut host = "0.0.0.0".to_string();
-    let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
