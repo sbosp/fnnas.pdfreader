@@ -54,8 +54,8 @@ if [ "$RELEASE" = "1" ]; then
     CARGO_PROFILE_DIR="release"
 else
     MODE="debug"
-    CARGO_PROFILE_FLAG=""
-    CARGO_PROFILE_DIR="debug"
+    CARGO_PROFILE_FLAG="--release"
+    CARGO_PROFILE_DIR="release"
 fi
 
 echo -e "${GREEN}=== PDF Reader 编译脚本 (Rust + lopdf) — ${MODE} 模式 ===${NC}"
