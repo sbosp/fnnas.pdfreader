@@ -452,11 +452,30 @@ fn get_doc_meta(path: &str) -> Result<(u32, Vec<(f64, f64)>), String> {
 // 抽第 page 页（0-based）成独立单页 PDF，返回 bytes。
 // 用 pdf_oxide 的 DocumentEditor::extract_pages_to_bytes：真正提取页面（保留内容/字体/图像），
 // 不修改原文档，直接返回只含该页的独立 PDF 字节。
+//
+// 关键：pdf_oxide 对某些页可能内部 panic（unwrap/越界等）而非返回 Err。若不拦截，
+// panic 会沿调用栈冒泡到 worker 的 catch_unwind——那时请求已未响应就被 drop，
+// 网关拿到裸断连接返回 502。这里用 catch_unwind 把 panic 转成 Err，
+// 保证路由层总能回一个正常的 HTTP 错误响应（服务不崩、无 502）。
 fn extract_page_pdf(path: &str, page: usize) -> Result<Vec<u8>, String> {
-    let mut editor = DocumentEditor::open(path).map_err(|e| format!("open: {e:?}"))?;
-    editor
-        .extract_pages_to_bytes(&[page])
-        .map_err(|e| format!("extract_pages_to_bytes: {e:?}"))
+    let path = path.to_string();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut editor = DocumentEditor::open(&path).map_err(|e| format!("open: {e:?}"))?;
+        editor
+            .extract_pages_to_bytes(&[page])
+            .map_err(|e| format!("extract_pages_to_bytes: {e:?}"))
+    }));
+    match result {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            Err(format!("pdf_oxide panic on page {page}: {msg}"))
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -761,7 +780,9 @@ fn route(
             }
             Err(e) => {
                 log(&format!("slice error {} p{}: {}", entry.name, page, e));
-                send!(error_response(404, "page out of range"));
+                // 返回 500 而非 404：让前端与日志能区分「抽页失败」和「页码越界」，
+                // 且始终发送一个正常 HTTP 响应，避免裸断连接导致网关 502。
+                send!(error_response(500, "extract page failed"));
             }
         }
     }
