@@ -1,8 +1,8 @@
 // PDF 阅读器 — Rust 服务端 (fnOS 统一网关版)
 //
 // 设计要点：
-//   * 纯 Rust，零 C 依赖：用 lopdf 把指定页无损抽成独立单页 PDF 切片返回
-//     （lopdf 保留页面内容流 + 字体/XObject 资源，pdf.js 端已验证文字/图像完整）
+//   * 纯 Rust，零 C 依赖：用 pdf_oxide 把指定页抽成独立单页 PDF 切片返回
+//     （交由前端 pdf.js 渲染）
 //   * 服务端不再光栅化（不出图片），渲染完全交给前端 pdf.js —— 内存问题从根上消失
 //   * 同时托管前端静态文件 + API
 //   * 书库递归扫描 *.pdf；bookId = sha1(realpath)[:16]，与旧 Python 版逐字节一致
@@ -16,7 +16,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use lopdf::{Document as PdfDoc, Object as PdfObj, ObjectId};
+use pdf_oxide::editor::DocumentEditor;
+use pdf_oxide::PdfDocument;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tiny_http::{Header, Method, Response, Server};
@@ -403,117 +404,59 @@ fn save_progress_entry(
 }
 
 // ----------------------------------------------------------------------------
-// PDF 处理（纯 Rust，lopdf 无损抽页）
+// PDF 处理（纯 Rust，pdf_oxide 0.3.74）
 // ----------------------------------------------------------------------------
 //
-// 不做文档缓存：lopdf 解析很快，每次请求直接 PdfDoc::load 打开即可，
-// 无常驻内存、无锁竞争，逻辑最简单。
-
-// 只读打开：解析文档并在闭包里读取（用于 meta 这类纯读操作，无需 clone）
-fn with_doc_cached<F, R>(path: &str, f: F) -> Result<R, String>
-where
-    F: FnOnce(&PdfDoc) -> R,
-{
-    let doc = PdfDoc::load(path).map_err(|e| format!("load: {e:?}"))?;
-    Ok(f(&doc))
-}
-
-// 取一份可修改的 Document（用于抽页等需改写的场景）
-fn load_doc_cached(path: &str) -> Result<PdfDoc, String> {
-    PdfDoc::load(path).map_err(|e| format!("load: {e:?}"))
-}
-
-fn obj_num(o: &PdfObj) -> f64 {
-    match o {
-        PdfObj::Integer(i) => *i as f64,
-        PdfObj::Real(r) => *r as f64,
-        _ => 0.0,
-    }
-}
-
-// MediaBox / Rotate 可能继承自 Pages 树，需沿 Parent 向上查找
-fn inherited_attr<'a>(
-    doc: &'a PdfDoc,
-    mut id: ObjectId,
-    key: &[u8],
-    max_depth: u32,
-) -> Option<&'a PdfObj> {
-    let mut depth = max_depth;
-    loop {
-        if depth == 0 {
-            return None;
-        }
-        let dict = doc.get_object(id).ok()?.as_dict().ok()?;
-        if let Ok(v) = dict.get(key) {
-            return Some(v);
-        }
-        let parent = dict.get(b"Parent").ok()?;
-        id = parent.as_reference().ok()?;
-        depth -= 1;
-    }
-}
-
-fn page_dimensions(doc: &PdfDoc, page_id: ObjectId) -> (f64, f64) {
-    let mut w = 612.0_f64;
-    let mut h = 792.0_f64;
-    if let Some(PdfObj::Array(a)) = inherited_attr(doc, page_id, b"MediaBox", 32) {
-        if a.len() == 4 {
-            let x0 = obj_num(&a[0]);
-            let y0 = obj_num(&a[1]);
-            let x1 = obj_num(&a[2]);
-            let y1 = obj_num(&a[3]);
-            w = (x1 - x0).abs();
-            h = (y1 - y0).abs();
-        }
-    }
-    let rotate = inherited_attr(doc, page_id, b"Rotate", 32)
-        .map(|o| (obj_num(o) as i64).rem_euclid(360))
-        .unwrap_or(0);
-    if rotate == 90 || rotate == 270 {
-        std::mem::swap(&mut w, &mut h);
-    }
-    (round1(w), round1(h))
-}
-
-fn get_doc_meta(path: &str) -> Result<(u32, Vec<(f64, f64)>), String> {
-    with_doc_cached(path, |doc| {
-        let pages = doc.get_pages(); // BTreeMap<页号(1-based), ObjectId>，已按页序排列
-        let cnt = pages.len() as u32;
-        let mut dims = Vec::with_capacity(pages.len());
-        for (_n, id) in &pages {
-            dims.push(page_dimensions(doc, *id));
-        }
-        (cnt, dims)
-    })
-}
+// 不做文档缓存：每次请求直接打开解析即可，无常驻内存、无锁竞争。
 
 fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
-// 抽第 page 页（0-based）成独立单页 PDF，返回 bytes。
-// 做法：clone 出整份文档 → 删掉除目标页外的所有页 → prune 孤立对象 → 重排+压缩 → 存到内存。
-// 关键：删页不触碰存活页的内容流与资源字典，因此字体/图像随页一起保留（已 pdf.js 验证）。
-fn extract_page_pdf(path: &str, page: usize) -> Result<Vec<u8>, String> {
-    let mut doc = load_doc_cached(path)?;
-    let pages = doc.get_pages();
-    let total = pages.len();
-    let target_1based = (page as u32) + 1;
-    if page >= total {
-        return Err(format!("page {} out of range (total {})", page, total));
+// 读元数据：页数 + 每页 (宽,高)。宽高由 get_page_media_box 计算得到
+// （旋转 90/270 时交换宽高以匹配前端显示方向）。
+fn get_doc_meta(path: &str) -> Result<(u32, Vec<(f64, f64)>), String> {
+    let t0 = std::time::Instant::now();
+    let doc = PdfDocument::open(path).map_err(|e| format!("open: {e:?}"))?;
+    let t_open = t0.elapsed();
+    let cnt = doc.page_count().map_err(|e| format!("page_count: {e:?}"))? as u32;
+    let t_count = t0.elapsed();
+    let mut dims = Vec::with_capacity(cnt as usize);
+    for i in 0..cnt as usize {
+        // MediaBox: (x0, y0, x1, y1)，用户空间单位
+        let (x0, y0, x1, y1) = doc
+            .get_page_media_box(i)
+            .map_err(|e| format!("media_box {i}: {e:?}"))?;
+        let mut w = (x1 - x0).abs() as f64;
+        let mut h = (y1 - y0).abs() as f64;
+        let rot = doc.get_page_rotation(i).unwrap_or(0).rem_euclid(360);
+        if rot == 90 || rot == 270 {
+            std::mem::swap(&mut w, &mut h);
+        }
+        dims.push((round1(w), round1(h)));
     }
-    let to_delete: Vec<u32> = pages
-        .keys()
-        .cloned()
-        .filter(|&n| n != target_1based)
-        .collect();
-    doc.delete_pages(&to_delete);
-    doc.prune_objects();
-    doc.renumber_objects();
-    doc.compress();
-    let mut buf: Vec<u8> = Vec::new();
-    doc.save_to(&mut buf).map_err(|e| format!("save: {e:?}"))?;
-    Ok(buf)
+    let t_dims = t0.elapsed();
+    log(&format!(
+        "meta 计时 [{}]: open={:?} page_count={:?}(+{:?}) dims={:?}(+{:?}) 共{}页",
+        path,
+        t_open,
+        t_count,
+        t_count - t_open,
+        t_dims,
+        t_dims - t_count,
+        cnt
+    ));
+    Ok((cnt, dims))
+}
+
+// 抽第 page 页（0-based）成独立单页 PDF，返回 bytes。
+// 用 pdf_oxide 的 DocumentEditor::extract_pages_to_bytes：真正提取页面（保留内容/字体/图像），
+// 不修改原文档，直接返回只含该页的独立 PDF 字节。
+fn extract_page_pdf(path: &str, page: usize) -> Result<Vec<u8>, String> {
+    let mut editor = DocumentEditor::open(path).map_err(|e| format!("open: {e:?}"))?;
+    editor
+        .extract_pages_to_bytes(&[page])
+        .map_err(|e| format!("extract_pages_to_bytes: {e:?}"))
 }
 
 // ----------------------------------------------------------------------------
@@ -747,7 +690,9 @@ fn route(
             None => send!(error_response(403, "Forbidden: gateway auth required")),
         };
         let bid = query.get("id").cloned().unwrap_or_default();
+        let t_meta = std::time::Instant::now();
         let file_map = load_file_map(&user.uid);
+        let t_map = t_meta.elapsed();
         let entry = match file_map.get(&bid) {
             Some(e) if e.type_ == "file" => e,
             _ => send!(error_response(404, "book not found")),
@@ -762,6 +707,12 @@ fn route(
                     .get(&bid)
                     .cloned()
                     .unwrap_or(serde_json::json!({}));
+                log(&format!(
+                    "meta 总耗时: {:?} (load_file_map={:?}) id={}",
+                    t_meta.elapsed(),
+                    t_map,
+                    bid
+                ));
                 send!(json_response(serde_json::json!({
                     "pageCount": cnt,
                     "pages": pages_json,

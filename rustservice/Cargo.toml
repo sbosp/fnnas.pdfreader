@@ -2,7 +2,7 @@
 name = "pdfserver"
 version = "3.0.0"
 edition = "2021"
-description = "PDF Reader backend (Rust) — pure-Rust lossless PDF page slicing over unix socket"
+description = "PDF Reader backend (Rust) — pure-Rust PDF page extraction over unix socket"
 
 [[bin]]
 name = "pdfserver"
@@ -10,8 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 tiny_http = "0.12"
-# lopdf：MIT/Apache-2.0，无损抽页（保留页面内容流 + 字体/XObject 资源）
-lopdf = "0.36"
+# pdf_oxide：纯 Rust PDF 库（MIT/Apache-2.0），DocumentEditor 抽页返回独立单页文档
+pdf_oxide = "0.3.74"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
