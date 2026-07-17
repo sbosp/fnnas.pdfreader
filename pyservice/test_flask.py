@@ -24,20 +24,28 @@ print("========================")
 import pdfserver as pdfserver
 
 if __name__ == '__main__':
-    try:
-        # 使用 TCP 模式启动（--port 5173）
-        pdfserver.args.port = 5173
-        pdfserver.args.host = '127.0.0.1'
-        pdfserver.args.debug = True
-        pdfserver.main()
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        raise
-    start = time.time()
-    print(len(pdfserver.extract_page_pdf(pdfserver.load_file_map('1213123213')['e995d9129a4b8a74'], 30, 1)),
-          time.time() - start)
-    start = time.time()
-    print(len(pdfserver.render_page(pdfserver.load_file_map('1213123213')['e995d9129a4b8a74'], 30, 180)),
-          time.time() - start)
-    start = time.time()
+    # try:
+    #     # 使用 TCP 模式启动（--port 5173）
+    #     pdfserver.args.port = 5173
+    #     pdfserver.args.host = '127.0.0.1'
+    #     pdfserver.args.debug = True
+    #     pdfserver.main()
+    # except Exception:
+    #     import traceback
+    #     traceback.print_exc()
+    #     raise
+    # start = time.time()
+    # print(len(pdfserver.extract_page_pdf(pdfserver.load_file_map('1213123213')['e995d9129a4b8a74'], 30, 1)),
+    #       time.time() - start)
+    # start = time.time()
+    # print(len(pdfserver.render_page(pdfserver.load_file_map('1213123213')['e995d9129a4b8a74'], 30, 180)),
+    #       time.time() - start)
+    # start = time.time()
+
+    entry = {
+        'path': '/vol3/@appshare/PDFLibrary/test.pdf',
+    }
+    for i in range(8):
+        start = time.time()
+        print(75 + i, len(pdfserver.extract_page_pdf(entry, 75 + i, 1)),
+              time.time() - start)
