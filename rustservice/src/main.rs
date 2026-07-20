@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use pdf_oxide::editor::DocumentEditor;
+use pdf_oxide::api::Pdf;
+use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -508,9 +510,11 @@ fn get_doc_meta(path: &str) -> Result<(u32, Vec<(f64, f64)>), String> {
 //   或同时打开多本大书，也不会让内存无上限膨胀。
 
 // 单本书的缓存条目：mtime 用于失效；editor 用 Mutex 串行化（extract 是 &mut self）。
+// last_used 用于 LRU 淘汰——避免打开的文档 editor 永久驻留导致内存只增不减。
 struct CachedDoc {
     mtime: i64,
     editor: DocumentEditor,
+    last_used: std::time::Instant,
 }
 
 // path -> 缓存条目。外层 Mutex 只在“取/换条目”时短暂持有，不覆盖抽页耗时。
@@ -518,6 +522,66 @@ static DOC_CACHE: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<CachedDoc>>>>> = Onc
 // 抽页并发闸门：用一个「许可数」计数信号量控制同时抽页数。
 static EXTRACT_GATE: OnceLock<(Mutex<usize>, std::sync::Condvar)> = OnceLock::new();
 const MAX_EXTRACT: usize = 3;
+
+// 【文档缓存容量上限 + 空闲淘汰】
+// 之前 DOC_CACHE 只增不减：每打开一本书，其 DocumentEditor（单本大书 ~182MB，
+// = fs::read 整本 + 解析缓存）就永久驻留内存。多开几本大书即累积到近 1GB，
+// NAS 内存有限 → 疯狂 swap → 进程「休眠 / CPU 0% 却极慢」（慢的真凶是换页）。
+// 对策：限制同时缓存的文档数，并淘汰空闲超时的条目，让内存有明确天花板。
+//   PDFR_DOC_CACHE_MAX   最多同时缓存几本书的 editor（默认 2）
+//   PDFR_DOC_IDLE_SECS   条目空闲多少秒后可被淘汰（默认 120s）
+const DOC_CACHE_MAX_DEFAULT: usize = 2;
+const DOC_IDLE_SECS_DEFAULT: u64 = 120;
+
+fn doc_cache_max() -> usize {
+    std::env::var("PDFR_DOC_CACHE_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(DOC_CACHE_MAX_DEFAULT)
+}
+fn doc_idle_secs() -> u64 {
+    std::env::var("PDFR_DOC_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DOC_IDLE_SECS_DEFAULT)
+}
+
+// 【扫描版 PDF 降体积】
+// 扫描版每页是一整张巨图（实测某教辅每页 4304×6142），直接抽 PDF 切片会把整张
+// 原图（~5MB）原样搬给前端，NAS 慢网下必然超时、打满 CPU、OOM 重启。
+// 对策：抽出的原始切片若超过 RASTER_THRESHOLD，判定为「图片主导页」，改用
+// tiny-skia 把该页渲染成低 DPI JPEG，再包成单页 PDF 返回（前端 pdf.js 照常解析）。
+// 实测：5MB 页 → ~30KB，缩小 ~160×，本机渲染 0.3s（NAS 留足余量不超时）。
+// 矢量页（纯文字排版）切片本就很小，不触发栅格化，保持矢量清晰。
+// 默认值（可被环境变量覆盖，方便运维在不重编译的前提下调参 / 排障）：
+//   PDFR_RASTER_THRESHOLD  原始切片超过多少字节才栅格化（默认 800KB）
+//   PDFR_RASTER_DPI        栅格化 DPI（默认 120）
+//   PDFR_RASTER_QUALITY    JPEG 质量 1..=100（默认 75）
+const RASTER_THRESHOLD_DEFAULT: usize = 800 * 1024;
+const RASTER_DPI_DEFAULT: u32 = 120;
+const RASTER_JPEG_QUALITY_DEFAULT: u8 = 75;
+
+fn raster_threshold() -> usize {
+    std::env::var("PDFR_RASTER_THRESHOLD")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(RASTER_THRESHOLD_DEFAULT)
+}
+fn raster_dpi() -> u32 {
+    std::env::var("PDFR_RASTER_DPI")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(RASTER_DPI_DEFAULT)
+}
+fn raster_quality() -> u8 {
+    std::env::var("PDFR_RASTER_QUALITY")
+        .ok()
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .filter(|&v| v >= 1 && v <= 100)
+        .unwrap_or(RASTER_JPEG_QUALITY_DEFAULT)
+}
 
 fn doc_cache() -> &'static Mutex<BTreeMap<String, Arc<Mutex<CachedDoc>>>> {
     DOC_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -565,8 +629,10 @@ fn get_cached_doc(path: &str) -> Result<Arc<Mutex<CachedDoc>>, String> {
     {
         let map = doc_cache().lock().unwrap();
         if let Some(entry) = map.get(path) {
-            // 命中且未过期：直接复用（不重新 fs::read）。
-            if entry.lock().unwrap().mtime == mtime {
+            // 命中且未过期：直接复用（不重新 fs::read），并刷新 last_used。
+            let mut g = entry.lock().unwrap();
+            if g.mtime == mtime {
+                g.last_used = std::time::Instant::now();
                 return Ok(entry.clone());
             }
         }
@@ -577,12 +643,74 @@ fn get_cached_doc(path: &str) -> Result<Arc<Mutex<CachedDoc>>, String> {
         DocumentEditor::open(&path_owned).map_err(|e| format!("open: {e:?}"))
     }))
     .map_err(|_| "pdf_oxide panic on open".to_string())??;
-    let entry = Arc::new(Mutex::new(CachedDoc { mtime, editor: opened }));
-    doc_cache()
-        .lock()
-        .unwrap()
-        .insert(path.to_string(), entry.clone());
+    let entry = Arc::new(Mutex::new(CachedDoc {
+        mtime,
+        editor: opened,
+        last_used: std::time::Instant::now(),
+    }));
+    {
+        let mut map = doc_cache().lock().unwrap();
+        map.insert(path.to_string(), entry.clone());
+        evict_docs(&mut map, path);
+    }
     Ok(entry)
+}
+
+// LRU + 空闲淘汰：把过期条目（空闲超时）和超出容量的最久未用条目移除。
+// keep 是当前请求正在使用的 path，绝不淘汰它。被移除的 Arc 若无其他持有者，
+// 其 DocumentEditor（连同整本文件缓存）随即析构，内存归还。
+fn evict_docs(map: &mut BTreeMap<String, Arc<Mutex<CachedDoc>>>, keep: &str) {
+    let now = std::time::Instant::now();
+    let idle = std::time::Duration::from_secs(doc_idle_secs());
+    let max = doc_cache_max();
+
+    // 先按空闲超时淘汰（idle=0 表示不按时间淘汰，只按容量）。
+    if !idle.is_zero() {
+        let stale: Vec<String> = map
+            .iter()
+            .filter(|(p, e)| {
+                p.as_str() != keep
+                    && e.lock()
+                        .map(|g| now.duration_since(g.last_used) > idle)
+                        .unwrap_or(false)
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in stale {
+            map.remove(&p);
+            log(&format!(
+                "doc cache evict (idle > {}s): {} ; now {} cached",
+                idle.as_secs(),
+                p,
+                map.len()
+            ));
+        }
+    }
+
+    // 再按容量上限淘汰：超出部分，移除 last_used 最早的（keep 除外）。
+    while map.len() > max {
+        let victim = map
+            .iter()
+            .filter(|(p, _)| p.as_str() != keep)
+            .min_by_key(|(_, e)| {
+                e.lock()
+                    .map(|g| g.last_used)
+                    .unwrap_or_else(|_| std::time::Instant::now())
+            })
+            .map(|(p, _)| p.clone());
+        match victim {
+            Some(p) => {
+                map.remove(&p);
+                log(&format!(
+                    "doc cache evict (over capacity, max={}): {} ; now {} cached",
+                    max,
+                    p,
+                    map.len()
+                ));
+            }
+            None => break, // 只剩 keep 了，停止
+        }
+    }
 }
 
 // 抽第 page 页（0-based）成独立单页 PDF，返回 bytes。
@@ -597,10 +725,30 @@ fn extract_page_pdf(path: &str, page: usize) -> Result<Vec<u8>, String> {
     let cached = get_cached_doc(path)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut guard = cached.lock().unwrap();
-        guard
+        // ① 先抽原始单页切片
+        let raw = guard
             .editor
             .extract_pages_to_bytes(&[page])
-            .map_err(|e| format!("extract_pages_to_bytes: {e:?}"))
+            .map_err(|e| format!("extract_pages_to_bytes: {e:?}"))?;
+        // ② 小切片（矢量页）直接返回，保持清晰
+        if raw.len() <= raster_threshold() {
+            return Ok(raw);
+        }
+        // ③ 大切片（扫描图主导页）→ 栅格化降体积。失败则回退返回原始切片，
+        //    保证「宁可大也别不可读」。
+        match rasterize_page(&mut guard.editor, page) {
+            Ok(small) if !small.is_empty() && small.len() < raw.len() => {
+                log(&format!(
+                    "rasterize page {} : {} -> {} bytes ({:.1}x)",
+                    page,
+                    raw.len(),
+                    small.len(),
+                    raw.len() as f64 / small.len().max(1) as f64
+                ));
+                Ok(small)
+            }
+            _ => Ok(raw),
+        }
     }));
     match result {
         Ok(r) => r,
@@ -613,6 +761,23 @@ fn extract_page_pdf(path: &str, page: usize) -> Result<Vec<u8>, String> {
             Err(format!("pdf_oxide panic on page {page}: {msg}"))
         }
     }
+}
+
+// 把第 page 页（0-based）用 tiny-skia 渲染成低 DPI JPEG，再包成单页 PDF。
+// 复用同一个已缓存的 DocumentEditor（其 source() 即渲染所需的 PdfDocument），
+// 不重新读盘。任何一步出错都返回 Err，由调用方回退到原始切片。
+fn rasterize_page(editor: &mut DocumentEditor, page: usize) -> Result<Vec<u8>, String> {
+    let mut opts = RenderOptions::default();
+    opts.dpi = raster_dpi();
+    opts.format = ImageFormat::Jpeg;
+    opts.jpeg_quality = raster_quality();
+    opts.background = Some([1.0, 1.0, 1.0, 1.0]);
+
+    let img = render_page(editor.source(), page, &opts)
+        .map_err(|e| format!("render_page: {e:?}"))?;
+    let mut pdf = Pdf::from_image_bytes(&img.data)
+        .map_err(|e| format!("from_image_bytes: {e:?}"))?;
+    pdf.to_bytes().map_err(|e| format!("to_bytes: {e:?}"))
 }
 
 // ----------------------------------------------------------------------------
