@@ -94,7 +94,6 @@ const PRELOAD_BEHIND = 1     // 向上预加载页数
 const OBSERVER_ROOT_MARGIN = '400px 0px' // 提前触发加载的缓冲距离
 const DEFAULT_PAGE_WIDTH = 595   // A4 默认宽（pt）
 const DEFAULT_PAGE_HEIGHT = 842  // A4 默认高（pt）
-const VIEWPORT_WIDTH_LIMIT = 900 // 页面显示的最大宽度（保持阅读舒适）
 // canvas 渲染上限，避免高分屏 devicePixelRatio 过大导致内存暴涨
 const MAX_DPR = 2
 
@@ -248,9 +247,25 @@ async function renderPageCanvas(pageNum: number): Promise<void> {
 
   const pdfPage = await doc.getPage(1)
   const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR)
+  const baseViewport = pdfPage.getViewport({scale: 1})
+
+  // 关键修复：以 pdf.js 实际渲染尺寸为准校正该页比例。
+  // meta 返回的是 MediaBox，而 pdf.js 渲染用 CropBox；若 meta 拿不到/超时还会
+  // 回退成 A4 默认值。任一情况都会让占位 div 的宽高比与真实位图对不上，
+  // canvas 被 CSS 撑满 div 后就被拉伸变形。这里用 baseViewport 的真实宽高
+  // 重写本页原始尺寸并重算显示尺寸，使 div 比例 == 位图比例，从根上消除变形。
+  if (baseViewport.width > 0 && baseViewport.height > 0) {
+    const realRatio = baseViewport.height / baseViewport.width
+    const curRatio = p.origHeight / p.origWidth
+    if (!isFinite(curRatio) || Math.abs(realRatio - curRatio) > 0.003) {
+      p.origWidth = baseViewport.width
+      p.origHeight = baseViewport.height
+      computeDisplaySize(p) // 按真实比例重算 displayWidth / displayHeight
+    }
+  }
+
   // displayWidth 为 CSS 像素，viewport scale = (显示宽 / PDF 点宽) × dpr
   const cssWidth = p.displayWidth
-  const baseViewport = pdfPage.getViewport({scale: 1})
   const renderScale = (cssWidth / baseViewport.width) * dpr
   const viewport = pdfPage.getViewport({scale: renderScale})
 
@@ -335,14 +350,14 @@ function teardownObserver() {
 }
 
 // ============ 尺寸计算 ============
+// 100% 缩放(scale=1)的定义：页面宽度铺满当前视口可用宽度，
+// 高度按该页真实宽高比(origHeight/origWidth)自适应算出。
+// scale>1 时在此基础上等比放大(可左右拖动看全内容)，scale<1 时缩小居中。
 function computeDisplaySize(p: PageItem) {
-  const vw = Math.min(
-      (viewportRef.value?.clientWidth || 800) - 24,
-      VIEWPORT_WIDTH_LIMIT
-  )
+  // 视口可用宽度 = 容器宽度 - 轨道左右内边距(12px×2)
+  const vw = (viewportRef.value?.clientWidth || 800) - 24
   const ratio = p.origHeight / p.origWidth
-  const baseWidth = Math.min(vw, p.origWidth * 1.2)
-  p.displayWidth = Math.round(baseWidth * scale.value)
+  p.displayWidth = Math.round(vw * scale.value)
   p.displayHeight = Math.round(p.displayWidth * ratio)
 }
 
@@ -570,6 +585,38 @@ function onTouchEnd(e: TouchEvent) {
   if (e.touches.length < 2) pinching = false
 }
 
+// ============ 窗口尺寸变化：宽度绑定视口，需重算并重绘 ============
+const handleResize = debounce(() => {
+  if (!pages.length) return
+  // 记录当前锚点页与页内比例，重算后滚回原位，避免跳动
+  const vp = viewportRef.value
+  let anchorPage = currentPage.value
+  let anchorRatio = 0
+  if (vp) {
+    const focus = vp.scrollTop + vp.clientHeight / 2
+    let acc = 0
+    for (let i = 0; i < pages.length; i++) {
+      const h = pages[i].displayHeight + 20
+      if (focus >= acc && focus < acc + h) {
+        anchorPage = i
+        anchorRatio = (focus - acc) / h
+        break
+      }
+      acc += h
+    }
+  }
+  recomputeAllSizes()
+  nextTick(() => {
+    if (vp) {
+      let top = 0
+      for (let i = 0; i < anchorPage && i < pages.length; i++) top += pages[i].displayHeight + 20
+      top += ((pages[anchorPage]?.displayHeight || 0) + 20) * anchorRatio
+      vp.scrollTop = Math.max(0, top - vp.clientHeight / 2)
+    }
+    rerenderVisible()
+  })
+}, 200)
+
 // ============ 生命周期 ============
 onMounted(async () => {
   bookId.value = route.params.bookId as string
@@ -581,6 +628,7 @@ onMounted(async () => {
     vp.addEventListener('touchend', onTouchEnd, {passive: true})
     vp.addEventListener('touchcancel', onTouchEnd, {passive: true})
   }
+  window.addEventListener('resize', handleResize)
 })
 
 onUnmounted(() => {
@@ -591,6 +639,7 @@ onUnmounted(() => {
     vp.removeEventListener('touchend', onTouchEnd)
     vp.removeEventListener('touchcancel', onTouchEnd)
   }
+  window.removeEventListener('resize', handleResize)
   teardownObserver()
   loader.clear()
   // 释放所有 pdf.js 文档
@@ -700,6 +749,8 @@ function close() {
   width: 100%;
   height: 100%;
   display: block;
+  /* 兜底防拉伸：即使 div 比例与位图有瞬时偏差，也按位图比例缩放留白边，绝不变形 */
+  object-fit: contain;
 }
 
 .ph-overlay {
