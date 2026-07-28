@@ -749,6 +749,11 @@ function close() {
   height: 100vh;
   display: flex;
   flex-direction: column;
+  /* 根容器锁定视口宽度并裁掉任何水平溢出，确保内部放大产生的横向滚动
+     只发生在 .image-viewport 内，绝不冒泡成整页水平滚动去撑大布局视口。 */
+  width: 100%;
+  max-width: 100vw;
+  overflow: hidden;
 }
 
 .reader-toolbar {
@@ -813,6 +818,11 @@ function close() {
   -webkit-overflow-scrolling: touch;
   touch-action: pan-x pan-y;
   overscroll-behavior: contain;
+  /* 关键：把内部内容的尺寸变化「关」在本容器内，横向溢出只产生本容器的
+     横向滚动，不冒泡去撑大页面级布局视口，从而不会触发全站媒体查询回退。
+     只用 layout（不加 size，避免 flex 容器塌陷）。 */
+  contain: layout;
+  max-width: 100%;
 }
 
 .pages-track {
@@ -899,7 +909,11 @@ function close() {
 }
 
 /* ============ 手机端适配 ============ */
-@media (max-width: 640px) {
+/* 关键：手机端判定用「触屏设备」(pointer: coarse) 而非 max-width。
+   双指放大后页面内容会横向溢出，在移动浏览器上可能撑大布局视口、越过
+   640px 断点，导致 @media(max-width) 失配、工具栏重现、页脚消失——看起来
+   就像「变回电脑端样式」。改用与内容宽度/缩放无关的设备特征后彻底根治。 */
+@media (pointer: coarse) {
   .reader-toolbar {
     display: none;
   }
