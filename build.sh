@@ -1,215 +1,122 @@
 #!/bin/bash
 
-# PDF Reader 编译脚本（Python + PyMuPDF + PyInstaller 版）
-# 用法:
-#   bash build.sh        # 默认 debug 模式：编译前端 + PyInstaller 打包后端 → appcenter-cli install-local
-#   bash build.sh -r     # release 模式：编译前端 + PyInstaller 打包后端 → fnpack build 打 fpk
-#
-# 关键约束（务必理解）：
-#   PyInstaller **不能交叉编译**——产物架构 == 打包所在机器的架构/OS。
-#   NAS 是 aarch64 Linux，所以「后端打包」这一步**必须在 aarch64 Linux 上执行**
-#   （NAS 本机，或等架构 Linux 容器）。在 macOS / x86 上执行会得到无法在 NAS
-#   运行的产物，脚本会检测并直接报错。
-#
-# 因此推荐工作流：
-#   * 前端可在任意机器编译（本脚本 Step 1）
-#   * 后端打包 + 打 fpk 在 NAS 上执行（本脚本 Step 2/3）
-#   或直接整脚本都在 NAS 上跑。
-#
-# 流程：
-#   1) 编译 Vue 前端 → 复制到 fpk 的 app/ui
-#   2) PyInstaller 打包 pyservice/pdfserver.py → 单文件二进制 → app/server/pdfserver
-#   3) 收尾：debug=appcenter-cli install-local / release=fnpack build
+# PDF Reader 编译脚本
+# 用法: bash build.sh
 
 set -e
 
+# 颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
-# -----------------------------------------------------------------------------
-# 参数解析
-# -----------------------------------------------------------------------------
-RELEASE=0
-SKIP_FRONTEND=0
-for arg in "$@"; do
-    case "$arg" in
-        -r|--release) RELEASE=1 ;;
-        --skip-frontend) SKIP_FRONTEND=1 ;;
-        -h|--help)
-            echo "用法: bash build.sh [-r] [--skip-frontend]"
-            echo "  (无参数)         debug：编译前端 + PyInstaller 打包后端 + appcenter-cli install-local"
-            echo "  -r|--release     release：编译前端 + PyInstaller 打包后端 + fnpack build 打 fpk"
-            echo "  --skip-frontend  跳过前端编译（仅重打后端，适合只改了 Python 时）"
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}未知参数: $arg${NC}"
-            echo "用法: bash build.sh [-r] [--skip-frontend]"
-            exit 1
-            ;;
-    esac
-done
-
-if [ "$RELEASE" = "1" ]; then
-    MODE="release"
-else
-    MODE="debug"
-fi
-
-echo -e "${GREEN}=== PDF Reader 编译脚本 (Python + PyInstaller) — ${MODE} 模式 ===${NC}"
+echo -e "${GREEN}=== PDF Reader 编译脚本 ===${NC}"
 
 # 项目根目录
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 FNOS_APP_DIR="$PROJECT_ROOT/fnnas.pdfreader"
-PY_DIR="$PROJECT_ROOT/pyservice"
-
-HOST_OS="$(uname -s)"
-HOST_ARCH="$(uname -m)"
 
 echo "项目根目录: $PROJECT_ROOT"
 echo "fnOS 应用目录: $FNOS_APP_DIR"
-echo "Python 服务端目录: $PY_DIR"
-echo "宿主机: ${HOST_OS}/${HOST_ARCH}"
-echo "构建模式: $MODE"
 
-# -----------------------------------------------------------------------------
-# [Step 1/3] 编译 Vue 前端
-# -----------------------------------------------------------------------------
-if [ "$SKIP_FRONTEND" = "1" ]; then
-    echo ""
-    echo -e "${YELLOW}[Step 1/3] 跳过前端编译（--skip-frontend）${NC}"
-else
-    echo ""
-    echo -e "${YELLOW}[Step 1/3] 编译 Vue 前端...${NC}"
-
-    cd "$PROJECT_ROOT/vueapp"
-
-    if [ ! -d "node_modules" ]; then
-        echo "安装 npm 依赖..."
-        npm install
-    fi
-
-    echo "执行 npm run build..."
-    npm run build
-
-    if [ ! -d "dist" ]; then
-        echo -e "${RED}错误: 构建失败，dist 目录不存在${NC}"
-        exit 1
-    fi
-
-    echo -e "${GREEN}Vue 前端编译完成${NC}"
-
-    echo ""
-    echo -e "${YELLOW}复制前端文件...${NC}"
-    UI_DIR="$FNOS_APP_DIR/app/ui"
-    rm -rf "$UI_DIR/assets"
-    cp -r dist/* "$UI_DIR/"
-    echo -e "${GREEN}前端文件复制完成${NC}"
-fi
-
-# -----------------------------------------------------------------------------
-# [Step 2/3] PyInstaller 打包 Python 服务端 → aarch64 Linux 单文件二进制
-# -----------------------------------------------------------------------------
 echo ""
-echo -e "${YELLOW}[Step 2/3] PyInstaller 打包 Python 服务端 (${MODE})...${NC}"
+echo -e "${YELLOW}[Step 1/3] 编译 Vue 前端...${NC}"
 
-# ---- 架构闸门：PyInstaller 不能交叉编译，必须在 aarch64 Linux 上打包 ----
-if [ "$HOST_OS" != "Linux" ] || { [ "$HOST_ARCH" != "aarch64" ] && [ "$HOST_ARCH" != "arm64" ]; }; then
-    echo -e "${RED}错误: 当前宿主机是 ${HOST_OS}/${HOST_ARCH}，PyInstaller 无法交叉编译出 aarch64 Linux 二进制。${NC}"
-    echo -e "${YELLOW}后端打包这一步必须在 aarch64 Linux 上执行，请任选其一：${NC}"
-    echo "  A) 直接在飞牛 NAS（aarch64 Linux）本机上运行本脚本"
-    echo "  B) 用等架构 Linux 容器打包，例如："
-    echo "       docker run --rm --platform linux/arm64 -v \"$PROJECT_ROOT\":/app -w /app/pyservice \\"
-    echo "         python:3.12-slim bash -lc 'pip install -r requirements.txt && pyinstaller --clean --noconfirm pdfserver.spec'"
-    echo "     然后把 pyservice/dist/pdfserver 复制到 $FNOS_APP_DIR/app/server/pdfserver"
-    echo ""
-    echo -e "${YELLOW}提示: 前端已编译完成（如未加 --skip-frontend）。到 NAS 上可加 --skip-frontend 只打后端。${NC}"
+cd "$PROJECT_ROOT/vueapp"
+
+# 检查 node_modules 是否存在，不存在则安装依赖
+if [ ! -d "node_modules" ]; then
+    echo "安装 npm 依赖..."
+    npm install
+fi
+
+# 执行构建
+echo "执行 npm run build..."
+npm run build
+
+# 检查 dist 目录
+if [ ! -d "dist" ]; then
+    echo -e "${RED}错误: 构建失败，dist 目录不存在${NC}"
     exit 1
 fi
 
-cd "$PY_DIR"
+echo -e "${GREEN}Vue 前端编译完成${NC}"
 
-# ---- 定位/创建打包用的 venv ----
-# Debian 等发行版启用了 PEP 668（externally-managed-environment），
-# 禁止直接往系统 Python 里 pip install。所以一律使用项目内的 venv 打包，
-# 既绕开 PEP 668，也不污染系统 Python。venv 只需建一次，后续复用。
-VENV_DIR="$PY_DIR/venv"
+# 复制前端文件到 fnos 应用目录
+echo ""
+echo -e "${YELLOW}[Step 2/3] 复制前端文件...${NC}"
 
-if [ ! -x "$VENV_DIR/bin/python" ]; then
-    echo "未发现打包用 venv，正在创建: $VENV_DIR"
-    # 找一个能建 venv 的系统 python3
-    SYS_PY=""
-    if command -v python3 >/dev/null 2>&1; then
-        SYS_PY="$(command -v python3)"
-    else
-        echo -e "${RED}错误: 未找到 python3，无法创建 venv${NC}"
-        exit 1
-    fi
-    if ! "$SYS_PY" -m venv "$VENV_DIR" 2>/dev/null; then
-        echo -e "${RED}错误: 创建 venv 失败。Debian 上可能需要先安装: apt install python3-venv python3-full${NC}"
-        exit 1
-    fi
+UI_DIR="$FNOS_APP_DIR/app/ui"
+
+rm -rf "$UI_DIR/assets"
+# 复制 dist 目录内容 直接覆盖同名文件或文件夹
+cp -r dist/* "$UI_DIR/"
+
+echo -e "${GREEN}前端文件复制完成${NC}"
+
+# 编译 Python 服务端
+echo ""
+echo -e "${YELLOW}[Step 3/3] 编译 Python 服务端...${NC}"
+
+cd "$PROJECT_ROOT/pyservice"
+
+# ====================== 1. 虚拟环境处理 ======================
+VENV_DIR="./venv"
+if [ -d "${VENV_DIR}" ]; then
+    echo -e "${GREEN}检测到已有虚拟环境，激活 venv...${NC}"
+    source "${VENV_DIR}/bin/activate"
+else
+    echo -e "${GREEN}未检测到 venv，创建全新虚拟环境...${NC}"
+    python3 -m venv "${VENV_DIR}"
+    source "${VENV_DIR}/bin/activate"
 fi
 
-PYBIN="$VENV_DIR/bin/python"
-echo "使用 Python: $PYBIN ($($PYBIN --version 2>&1))"
+# ====================== 2. 清华源安装依赖 ======================
+echo -e "${GREEN}使用清华源安装 requirements.txt 依赖...${NC}"
+python -m pip install --upgrade pip setuptools wheel -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 确保依赖 + pyinstaller 就绪（在 venv 内安装，不触发 PEP 668）
-# 统一用清华 PyPI 镜像，避免国内直连官方源缓慢/超时。
-PIP_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
-PIP_HOST="pypi.tuna.tsinghua.edu.cn"
-if ! "$PYBIN" -c "import PyInstaller" 2>/dev/null; then
-    echo "安装打包依赖（含 pyinstaller）到 venv（清华源）..."
-    "$PYBIN" -m pip install --upgrade pip -i "$PIP_INDEX" --trusted-host "$PIP_HOST"
-    "$PYBIN" -m pip install -r requirements.txt -i "$PIP_INDEX" --trusted-host "$PIP_HOST"
-fi
+# 执行 PyInstaller 打包
+echo "执行 pyinstaller..."
+pyinstaller -F -w --optimize 2 --strip pdfserver_flask.py
+pyinstaller -F -w --optimize 2 --noconfirm pdfserver.py
 
-# 执行打包
-rm -rf build dist
-"$PYBIN" -m PyInstaller --clean --noconfirm pdfserver.spec
-
-BIN_OUT="$PY_DIR/dist/pdfserver"
-if [ ! -f "$BIN_OUT" ]; then
-    echo -e "${RED}错误: PyInstaller 打包失败，未找到 $BIN_OUT${NC}"
-    exit 1
-fi
-
-# 校验产物架构（应为 aarch64/ARM64 ELF）
-echo "产物信息:"
-file "$BIN_OUT" || true
-ARCH_OK="$(file "$BIN_OUT" 2>/dev/null | grep -Ei 'ELF.*(aarch64|ARM aarch64)' || true)"
-if [ -z "$ARCH_OK" ]; then
-    echo -e "${RED}错误: 产物不是 aarch64 Linux ELF，请检查打包环境${NC}"
+# 检查编译结果
+if [ ! -f "dist/pdfserver_flask" ]; then
+if [ ! -f "dist/pdfserver" ]; then
+    echo -e "${RED}错误: PyInstaller 编译失败${NC}"
     exit 1
 fi
 
 # 复制到 fnos 应用目录
 SERVER_DIR="$FNOS_APP_DIR/app/server"
 mkdir -p "$SERVER_DIR"
-cp -f "$BIN_OUT" "$SERVER_DIR/pdfserver"
-chmod +x "$SERVER_DIR/pdfserver"
 
-echo -e "${GREEN}Python 服务端打包完成 → $SERVER_DIR/pdfserver（$(du -h "$SERVER_DIR/pdfserver" | cut -f1)）${NC}"
+# 复制可执行文件并重命名
+cp -f dist/pdfserver_flask "$SERVER_DIR/pdfserver"
+cp -f dist/pdfserver "$SERVER_DIR/pdfserver"
 
-# -----------------------------------------------------------------------------
-# [Step 3/3] 收尾
-# -----------------------------------------------------------------------------
+echo -e "${GREEN}Python 服务端编译完成${NC}"
+
+# 安装到 fnOS
 echo ""
+echo -e "${YELLOW}[Install] 安装到 fnOS...${NC}"
+
 cd "$FNOS_APP_DIR"
 
-if [ "$RELEASE" = "1" ]; then
-    echo -e "${YELLOW}[Step 3/3] 打包 fpk...${NC}"
-    fnpack build
-    echo ""
-    echo -e "${GREEN}=== 编译完成 (release / fpk 已打包) ===${NC}"
-else
-    echo -e "${YELLOW}[Step 3/3] 安装到 fnOS 调试 (appcenter-cli install-local)...${NC}"
-    appcenter-cli install-local
-    echo ""
-    echo -e "${GREEN}=== 编译完成 (debug / 已安装到 fnOS) ===${NC}"
-fi
+#fnpack build
+fnpack build
+#
+#appcenter-cli install-fpk fnnas.pdfreader.fpk
 
+echo "执行 appcenter-cli install-local..."
+appcenter-cli install-local
+#echo "执行 appcenter-cli install-local..."
+#appcenter-cli install-local
+
+echo ""
+echo -e "${GREEN}=== 编译完成 ===${NC}"
 echo "应用目录: $FNOS_APP_DIR"
+
