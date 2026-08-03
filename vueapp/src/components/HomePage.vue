@@ -459,7 +459,7 @@ onMounted(() => {
 .grid {
   display: grid;
   gap: 16px;
-  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
 }
 
 /* 空状态 */
@@ -480,7 +480,10 @@ onMounted(() => {
 }
 
 /* 响应式设计 */
-@media (max-width: 640px) {
+/* 手机端判定用「触屏设备」(pointer: coarse) 而非 max-width：与 reader 页保持一致。
+   若用 max-width，一旦布局视口被内容/缩放撑过 640px 断点就会整体失配、退回电脑
+   样式（放大后表现为「变回电脑端」）。改用与宽度/缩放无关的设备特征后彻底根治。 */
+@media (pointer: coarse) {
   .topbar {
     padding: 0 10px;
     gap: 8px;

@@ -13,14 +13,20 @@
 
     <!-- 视口 -->
     <div class="image-viewport" ref="viewportRef" @scroll.passive="handleScroll">
+      <!-- 缩放隔离层：双指手势期间只对这一层做 CSS transform 视觉缩放，
+           transform-origin 固定为「顶部 + 水平居中」，缩放永远围绕水平中线展开，
+           不会跑出左边界，也不改动任何布局盒子尺寸。外层 image-viewport 的
+           contain:layout + overflow 把视觉溢出严格关在容器内，绝不撑大布局视口。 -->
+      <div
+          class="zoom-layer"
+          :style="pinchVisualScale !== 1 ? {
+            transform: `scale(${pinchVisualScale})`,
+          } : undefined"
+      >
       <!-- 内容轨道：宽度取最宽页面，放大后可左右拖动查看全部内容，缩小时居中 -->
       <div
           class="pages-track"
           ref="trackRef"
-          :style="pinchVisualScale !== 1 ? {
-            transform: `scale(${pinchVisualScale})`,
-            transformOrigin: pinchOrigin,
-          } : undefined"
       >
         <div
             v-for="page in pages"
@@ -55,6 +61,7 @@
           </div>
         </div>
       </div>
+      </div>
     </div>
 
     <!-- 页脚页码标记（手机端顶部工具栏隐藏时的页码提示）-->
@@ -78,8 +85,6 @@ const route = useRoute()
 const router = useRouter()
 const viewportRef = ref<HTMLElement>()
 const trackRef = ref<HTMLElement>()
-// 双指临时缩放的 transform-origin（跟随捏合中心，观感更自然）
-const pinchOrigin = ref('50% 0')
 
 // ============ 基础状态 ============
 const bookId = ref<string>('')
@@ -626,15 +631,9 @@ function onTouchStart(e: TouchEvent) {
     pinchStartScale = scale.value
     const vp = viewportRef.value
     const rect = vp?.getBoundingClientRect()
-    const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2
     const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2
+    // 记录捏合中心相对视口顶部的 Y，作为手势结束时的垂直锚点。
     pinchAnchorY = rect ? midY - rect.top : midY
-    // transform-origin 用「捏合中心在轨道坐标系里的位置」，缩放围绕手指中心展开。
-    if (vp && rect) {
-      const originX = midX - rect.left + vp.scrollLeft
-      const originY = midY - rect.top + vp.scrollTop
-      pinchOrigin.value = `${originX}px ${originY}px`
-    }
     pinchVisualScale.value = 1
   }
 }
@@ -673,18 +672,15 @@ function onTouchEnd(e: TouchEvent) {
 function commitPinchZoom(newScale: number) {
   newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, newScale))
   const vp = viewportRef.value
-  // 先记录捏合中心当前对应的「内容焦点」(在旧 transform 下的真实滚动坐标)。
-  // 旧视觉倍率 vis 下，轨道内容被以 pinchOrigin 为原点放大了 vis 倍，
-  // 视口里 pinchAnchorY 处对应的内容点 = origin + (anchor在视口的绝对Y - origin)/vis。
+  // origin 固定为 `top center`（垂直 0，水平居中）。手势期间 zoom-layer 以其
+  // 自身顶部为原点被放大 vis 倍，因此视口内 pinchAnchorY 处看到的内容，其在
+  // 「未缩放坐标系」中的真实 Y = (vp.scrollTop + pinchAnchorY) / vis。
+  // 水平方向 origin 在中线，缩放不改变水平中心 → 提交后统一 centerHorizontally。
   let focusPage = currentPage.value
   let focusRatio = 0
   if (vp) {
     const vis = pinchVisualScale.value
-    // 捏合中心在「未缩放内容坐标系」中的 Y
-    const originY = parseFloat(pinchOrigin.value.split(' ')[1]) || 0
-    const absYInViewport = pinchAnchorY // 相对视口顶部
-    const contentYVisual = vp.scrollTop + absYInViewport // transform 后视觉坐标
-    const contentY = originY + (contentYVisual - originY) / vis // 反解到未缩放坐标
+    const contentY = (vp.scrollTop + pinchAnchorY) / vis // 反解到未缩放坐标
     let acc = 0
     for (let i = 0; i < pages.length; i++) {
       const h = pages[i].displayHeight + 20
@@ -867,6 +863,18 @@ function close() {
   max-width: 100%;
 }
 
+/* 缩放隔离层：双指手势期间唯一被 transform 缩放的元素。
+   transform-origin 固定「顶部 + 水平居中」，保证：
+   - 放大/缩小始终围绕水平中线展开，内容永远不会跑出左边界导致显示不全；
+   - 缩放产生的视觉溢出被外层 image-viewport 的 contain+overflow 关住，
+     不撑大布局视口，因此不会「变回电脑端样式」。
+   自身 width:100% 且不参与 flex 拉伸，布局盒子尺寸恒定，只有视觉被缩放。 */
+.zoom-layer {
+  width: 100%;
+  transform-origin: top center;
+  will-change: transform;
+}
+
 .pages-track {
   display: flex;
   flex-direction: column;
@@ -875,9 +883,6 @@ function close() {
   min-width: 100%;
   box-sizing: border-box;
   padding: 0 12px;
-  /* 双指临时缩放走 CSS transform：提示浏览器用 GPU 合成层，缩放跟手流畅；
-     手势结束清掉 transform 后即回到普通布局，不残留合成开销。 */
-  will-change: transform;
 }
 
 .image-page {

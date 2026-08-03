@@ -98,7 +98,9 @@ body {
 }
 
 /* 响应式设计 */
-@media (max-width: 640px) {
+/* 手机端判定统一用 pointer: coarse（触屏特征），与 HomePage / PdfReader 保持一致，
+   避免布局视口被撑过 640px 断点时手机端规则失配、退回电脑样式。 */
+@media (pointer: coarse) {
   .topbar .user {
     display: none;
   }
