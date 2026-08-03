@@ -132,23 +132,39 @@ fi
 
 cd "$PY_DIR"
 
-# 定位 Python 与 pyinstaller：优先项目 venv，其次系统
-PYBIN=""
-if [ -x "$PY_DIR/venv/bin/python" ]; then
-    PYBIN="$PY_DIR/venv/bin/python"
-elif command -v python3 >/dev/null 2>&1; then
-    PYBIN="$(command -v python3)"
-else
-    echo -e "${RED}错误: 未找到 python3${NC}"
-    exit 1
+# ---- 定位/创建打包用的 venv ----
+# Debian 等发行版启用了 PEP 668（externally-managed-environment），
+# 禁止直接往系统 Python 里 pip install。所以一律使用项目内的 venv 打包，
+# 既绕开 PEP 668，也不污染系统 Python。venv 只需建一次，后续复用。
+VENV_DIR="$PY_DIR/venv"
+
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    echo "未发现打包用 venv，正在创建: $VENV_DIR"
+    # 找一个能建 venv 的系统 python3
+    SYS_PY=""
+    if command -v python3 >/dev/null 2>&1; then
+        SYS_PY="$(command -v python3)"
+    else
+        echo -e "${RED}错误: 未找到 python3，无法创建 venv${NC}"
+        exit 1
+    fi
+    if ! "$SYS_PY" -m venv "$VENV_DIR" 2>/dev/null; then
+        echo -e "${RED}错误: 创建 venv 失败。Debian 上可能需要先安装: apt install python3-venv python3-full${NC}"
+        exit 1
+    fi
 fi
+
+PYBIN="$VENV_DIR/bin/python"
 echo "使用 Python: $PYBIN ($($PYBIN --version 2>&1))"
 
-# 确保依赖 + pyinstaller 就绪
+# 确保依赖 + pyinstaller 就绪（在 venv 内安装，不触发 PEP 668）
+# 统一用清华 PyPI 镜像，避免国内直连官方源缓慢/超时。
+PIP_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
+PIP_HOST="pypi.tuna.tsinghua.edu.cn"
 if ! "$PYBIN" -c "import PyInstaller" 2>/dev/null; then
-    echo "安装打包依赖（pyinstaller + requirements）..."
-    "$PYBIN" -m pip install --upgrade pip
-    "$PYBIN" -m pip install -r requirements.txt
+    echo "安装打包依赖（含 pyinstaller）到 venv（清华源）..."
+    "$PYBIN" -m pip install --upgrade pip -i "$PIP_INDEX" --trusted-host "$PIP_HOST"
+    "$PYBIN" -m pip install -r requirements.txt -i "$PIP_INDEX" --trusted-host "$PIP_HOST"
 fi
 
 # 执行打包
