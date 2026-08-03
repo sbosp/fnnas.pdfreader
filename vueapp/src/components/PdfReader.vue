@@ -94,7 +94,34 @@ const startFrac = ref(0)
 const MIN_SCALE = 0.5
 const MAX_SCALE = 3
 const zoomLevels = [0.5, 0.75, 1, 1.25, 1.5, 2, 3]
-const scale = ref(1)
+
+// ============ 缩放比例本地持久化（按设备，localStorage）============
+// 需求：修改后的缩放比例记录到「当前设备本地」，下次打开默认沿用。
+// 与服务端进度里的 scale（跨设备）区分开——本地这份是设备级偏好，优先级更高。
+const ZOOM_STORE_KEY = 'pdfreader.zoom.scale'
+
+function loadLocalScale(): number {
+  try {
+    const raw = localStorage.getItem(ZOOM_STORE_KEY)
+    if (raw == null) return 1
+    const v = parseFloat(raw)
+    if (!isFinite(v)) return 1
+    return Math.min(MAX_SCALE, Math.max(MIN_SCALE, v))
+  } catch {
+    return 1
+  }
+}
+
+function saveLocalScale(v: number) {
+  try {
+    localStorage.setItem(ZOOM_STORE_KEY, String(v))
+  } catch {
+    /* localStorage 不可用（隐私模式等）时静默忽略 */
+  }
+}
+
+// 初始 scale 直接取本地记录，实现「下次打开默认用本地缩放」
+const scale = ref(loadLocalScale())
 // 双指手势进行中的「瞬时视觉倍率」：仅用 CSS transform 缩放内容轨道，
 // 不改 div 布局尺寸、不改 canvas 位图、不触发懒加载/重渲染。
 // 手势结束时才把它折算进真实 scale 并重排+重绘（矢量清晰）。=1 表示无临时缩放。
@@ -488,6 +515,7 @@ async function loadMeta() {
     await nextTick()
     setupObserver()
     scrollToPage(currentPage.value, startFrac.value)
+    centerHorizontally() // 初始若本地缩放>1，内容比视口宽，先横向居中
   } catch (e) {
     console.error('加载文档元数据失败', e)
   }
@@ -506,6 +534,15 @@ function scrollToPage(pageNum: number, frac = 0) {
 }
 
 // ============ 缩放 ============
+// 缩放后横向居中：内容(track)比视口宽时，把横向滚动停在正中，让页面左右居中显示。
+// 内容不比视口宽时 scrollWidth==clientWidth，scrollLeft 归 0 即天然居中。
+function centerHorizontally() {
+  const vp = viewportRef.value
+  if (!vp) return
+  const extra = vp.scrollWidth - vp.clientWidth
+  vp.scrollLeft = extra > 0 ? Math.round(extra / 2) : 0
+}
+
 // 重绘节流：缩放停止后再按新 scale 重渲染可视页 canvas（矢量始终清晰）
 const rerenderVisible = debounce(() => {
   for (const [pageNum] of pageDocs) {
@@ -540,6 +577,7 @@ function applyZoom(newScale: number, anchorClientY?: number) {
   }
 
   scale.value = newScale
+  saveLocalScale(newScale) // 记录到本设备本地
   recomputeAllSizes()
 
   nextTick(() => {
@@ -549,6 +587,7 @@ function applyZoom(newScale: number, anchorClientY?: number) {
     }
     top += ((pages[anchorPage]?.displayHeight || 0) + 20) * anchorRatio
     vp.scrollTop = Math.max(0, top - anchorY)
+    centerHorizontally() // 缩放后左右居中
   })
   // 按新 scale 重绘已加载页的 canvas，保证矢量清晰不发虚
   rerenderVisible()
@@ -661,6 +700,7 @@ function commitPinchZoom(newScale: number) {
   // 清掉临时视觉缩放，切到真实 scale 并重排
   pinchVisualScale.value = 1
   scale.value = newScale
+  saveLocalScale(newScale) // 记录到本设备本地
   recomputeAllSizes()
 
   nextTick(() => {
@@ -669,6 +709,7 @@ function commitPinchZoom(newScale: number) {
       for (let i = 0; i < focusPage && i < pages.length; i++) top += pages[i].displayHeight + 20
       top += ((pages[focusPage]?.displayHeight || 0) + 20) * focusRatio
       vp.scrollTop = Math.max(0, top - pinchAnchorY)
+      centerHorizontally() // 缩放后左右居中
     }
     // 按新 scale 重绘已加载页 canvas，矢量重新光栅化 → 放大后依旧锐利
     rerenderVisible()
@@ -702,6 +743,7 @@ const handleResize = debounce(() => {
       for (let i = 0; i < anchorPage && i < pages.length; i++) top += pages[i].displayHeight + 20
       top += ((pages[anchorPage]?.displayHeight || 0) + 20) * anchorRatio
       vp.scrollTop = Math.max(0, top - vp.clientHeight / 2)
+      centerHorizontally() // 重排后保持横向居中
     }
     rerenderVisible()
   })
