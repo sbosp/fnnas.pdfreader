@@ -80,11 +80,11 @@ python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/s
 
 # 执行 PyInstaller 打包
 echo "执行 pyinstaller..."
-pyinstaller -F -w --optimize 2 --strip pdfserver_flask.py
+pyinstaller -F -w --optimize 2 --strip pdfserver.py
 pyinstaller -F -w --optimize 2 --noconfirm pdfserver.py
 
 # 检查编译结果
-if [ ! -f "dist/pdfserver_flask" ]; then
+if [ ! -f "dist/pdfserver" ]; then
 if [ ! -f "dist/pdfserver" ]; then
     echo -e "${RED}错误: PyInstaller 编译失败${NC}"
     exit 1
@@ -95,7 +95,7 @@ SERVER_DIR="$FNOS_APP_DIR/app/server"
 mkdir -p "$SERVER_DIR"
 
 # 复制可执行文件并重命名
-cp -f dist/pdfserver_flask "$SERVER_DIR/pdfserver"
+cp -f dist/pdfserver "$SERVER_DIR/pdfserver"
 cp -f dist/pdfserver "$SERVER_DIR/pdfserver"
 
 echo -e "${GREEN}Python 服务端编译完成${NC}"
