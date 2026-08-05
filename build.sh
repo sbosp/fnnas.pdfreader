@@ -106,10 +106,10 @@ cd "$FNOS_APP_DIR"
 #fnpack build
 fnpack build
 #
-#appcenter-cli install-fpk fnnas.pdfreader.fpk
+appcenter-cli install-fpk fnnas.pdfreader.fpk
 
-echo "执行 appcenter-cli install-local..."
-appcenter-cli install-local
+#echo "执行 appcenter-cli install-local..."
+#appcenter-cli install-local
 #echo "执行 appcenter-cli install-local..."
 #appcenter-cli install-local
 
