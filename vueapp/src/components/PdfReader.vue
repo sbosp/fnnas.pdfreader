@@ -941,6 +941,12 @@ function close() {
    自身 width:100% 且不参与 flex 拉伸，布局盒子尺寸恒定，只有视觉被缩放。 */
 .zoom-layer {
   width: 100%;
+  /* 让内部 pages-track 在自身宽度内水平居中：track 窄于视口时天然居中，
+   宽于视口（放大态）时靠 centerHorizontally 的 scrollLeft 居中。缺这层
+     flex 居中会导致 track 靠左排、页面不居中。 */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   transform-origin: top center;
   will-change: transform;
 }
