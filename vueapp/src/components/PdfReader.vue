@@ -13,18 +13,10 @@
 
     <!-- 视口 -->
     <div class="image-viewport" ref="viewportRef" @scroll.passive="handleScroll">
-      <!-- 缩放隔离层：双指手势期间只对这一层做 CSS transform 视觉缩放，
-           transform-origin 固定为「顶部 + 水平居中」，缩放永远围绕水平中线展开，
-           不会跑出左边界，也不改动任何布局盒子尺寸。外层 image-viewport 的
-           contain:layout + overflow 把视觉溢出严格关在容器内，绝不撑大布局视口。 -->
-      <div
-          class="zoom-layer"
-          ref="zoomLayerRef"
-          :style="pinchVisualScale !== 1 ? {
-            transform: `translate(${pinchTx}px, ${pinchTy}px) scale(${pinchVisualScale})`,
-          } : undefined"
-      >
-      <!-- 内容轨道：宽度取最宽页面，放大后可左右拖动查看全部内容，缩小时居中 -->
+      <!-- 内容轨道：scale 是唯一数据源，直接决定每页 displayWidth。
+           居中完全靠 track 的 align-items:center 天然保证（不用任何 transform），
+           因此永远不会跑偏。缩小时 track 撑满视口页面居中；放大时 track 比视口宽，
+           产生横向滚动可拖动查看。 -->
       <div
           class="pages-track"
           ref="trackRef"
@@ -62,7 +54,6 @@
           </div>
         </div>
       </div>
-      </div>
     </div>
 
     <!-- 页脚页码标记（手机端顶部工具栏隐藏时的页码提示）-->
@@ -86,7 +77,6 @@ const route = useRoute()
 const router = useRouter()
 const viewportRef = ref<HTMLElement>()
 const trackRef = ref<HTMLElement>()
-const zoomLayerRef = ref<HTMLElement>()
 
 // ============ 基础状态 ============
 const bookId = ref<string>('')
@@ -128,17 +118,9 @@ function saveLocalScale(v: number) {
 }
 
 // 初始 scale 直接取本地记录，实现「下次打开默认用本地缩放」
+// scale 是缩放的「唯一数据源」：它直接决定每页 displayWidth，居中靠 CSS 天然保证。
 const scale = ref(loadLocalScale())
-// 双指手势进行中的「瞬时视觉倍率」：仅用 CSS transform 缩放内容轨道，
-// 不改 div 布局尺寸、不改 canvas 位图、不触发懒加载/重渲染。
-// 手势结束时才把它折算进真实 scale 并重排+重绘（矢量清晰）。=1 表示无临时缩放。
-const pinchVisualScale = ref(1)
-// 手势期间为「以双指中心相对缩放」而叠加的平移补偿（px，相对 zoom-layer）。
-// scale 会让双指焦点绕 transform-origin(top center) 漂移，用 translate 抵消，
-// 使双指中心在缩放前后始终贴在屏幕同一物理点上 → 真正的「捏合中心缩放」。
-const pinchTx = ref(0)
-const pinchTy = ref(0)
-const zoomLabel = computed(() => `${Math.round(scale.value * pinchVisualScale.value * 100)}%`)
+const zoomLabel = computed(() => `${Math.round(scale.value * 100)}%`)
 
 // ============ 常量配置 ============
 const MAX_CONCURRENT = 3     // 最大并发加载数
@@ -151,8 +133,11 @@ const DEFAULT_PAGE_HEIGHT = 842  // A4 默认高（pt）
 // 更高的 dpr 收益极小却翻倍内存，故上限取 3。
 const MAX_DPR = 3
 // .image-viewport 的上内边距（CSS: padding: 12px 0）。scrollTop 基准在 padding 之后，
-// 而双指锚点/pinchFocusY 基于内容层顶部，两者相差这一段，缩放定位时需补偿。
+// 而内容坐标基于第一页顶部，两者相差这一段，缩放定位时需补偿。
 const VIEWPORT_PAD_TOP = 12
+// .pages-track 的左内边距（CSS: padding: 0 12px）。页面左边缘 = track 左 + 此值，
+// 水平锚定双指中心时需补偿。
+const TRACK_PAD_LEFT = 12
 
 // ============ 页面数据 ============
 interface PageItem {
@@ -619,21 +604,25 @@ function zoomOut() {
 }
 
 // ============ 双指缩放手势 ============
-// 设计：手势进行中「只做 CSS transform 视觉缩放」，绝不改 div 布局尺寸、
-// 不改 canvas 位图、不触发 IntersectionObserver、不重新下载/渲染——因此
-// 放大过程丝滑、绝无「重新加载」。手势结束(onTouchEnd)才把视觉倍率一次性
-// 折算进真实 scale，做一次真实重排 + 按新 scale 重绘(矢量清晰)。
+// 新架构：scale 是唯一数据源，手势期间「实时改 scale 触发重排」。
+// 居中靠 pages-track 的 align-items:center 天然保证（绝不用 transform，
+// 因此永不存在 transform-origin / 焦点反解带来的跑偏、不居中问题）。
+// 手势中只改 div 尺寸、canvas 位图不重绘（CSS 拉伸略糊但流畅）；
+// 松手后才按最终 scale 重新光栅化可视页 canvas（恢复矢量清晰）。
+// 锚定：手势起点锁定「双指中心指向的内容坐标」，期间用 scrollTop/scrollLeft
+// 让该内容点始终跟随双指中心 —— 纯滚动实现，不碰 transform。
 let pinchStartDist = 0
 let pinchStartScale = 1
-let pinchAnchorY = 0     // 捏合中心相对视口顶部的 Y（用于结束时的锚点定位）
-// 双指中心相对 zoom-layer 的 transform-origin(top center) 的坐标，
-// 用于手势期间实时计算 translate 补偿，实现「以双指中心相对缩放」。
-let pinchFocusX = 0      // 水平：相对内容层水平中线（右为正）
-let pinchFocusY = 0      // 垂直：相对内容层顶部（下为正）
-let pinchStartMidX = 0   // 手势起始双指中心 X（视口坐标），用于跟手平移
-let pinchStartMidY = 0   // 手势起始双指中心 Y
-let pinchPanY = 0        // 手势期间双指中心的垂直位移（跟手平移量），提交时用于对齐
-let pinchPanX = 0        // 手势期间双指中心的水平位移，提交时用于对齐水平焦点
+// 手势起点锁定的「双指中心指向的内容坐标」（在 pinchStartScale 布局下测）：
+let pinchContentX = 0    // 相对「页面内容左边缘」的水平坐标（px）
+let pinchContentY = 0    // 相对「第一页内容顶部」的垂直坐标（px）
+// 双指中心最新屏幕位置（视口坐标），手势期间实时更新实现跟手。
+let pinchLastMidX = 0
+let pinchLastMidY = 0
+// 手势期间的 rAF 节流：把高频 touchmove 合并为每帧最多一次重排。
+let pinchRafPending = false
+let pinchPendingScale = 1
+let pinchVpRect: DOMRect | null = null  // 手势起点缓存的视口 rect（手势期间不变）
 let pinching = false
 
 function touchDist(t0: Touch, t1: Touch) {
@@ -643,35 +632,22 @@ function touchDist(t0: Touch, t1: Touch) {
 }
 
 function onTouchStart(e: TouchEvent) {
-  if (e.touches.length === 2) {
-    pinching = true
-    pinchStartDist = touchDist(e.touches[0], e.touches[1])
-    pinchStartScale = scale.value
-    const vp = viewportRef.value
-    const rect = vp?.getBoundingClientRect()
-    const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2
-    const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2
-    // 记录捏合中心相对视口顶部的 Y，作为手势结束时的垂直锚点。
-    pinchAnchorY = rect ? midY - rect.top : midY
-    // 记录起始双指中心（视口坐标），用于手势期间的跟手平移。
-    pinchStartMidX = midX
-    pinchStartMidY = midY
-    // 记录双指中心相对 zoom-layer 的 transform-origin(top center) 的坐标。
-    // 手势开始瞬间 pinchVisualScale=1、无 translate，zoom-layer 未变形，
-    // 其 rect 就是未缩放态的真实几何：顶部 = rect.top，水平中线 = rect.left+width/2。
-    const zl = zoomLayerRef.value
-    const zr = zl?.getBoundingClientRect()
-    if (zr) {
-      pinchFocusX = midX - (zr.left + zr.width / 2) // 相对水平中线，右为正
-      pinchFocusY = midY - zr.top                    // 相对内容层顶部，下为正
-    } else {
-      pinchFocusX = 0
-      pinchFocusY = 0
-    }
-    pinchTx.value = 0
-    pinchTy.value = 0
-    pinchVisualScale.value = 1
-  }
+  if (e.touches.length !== 2) return
+  const vp = viewportRef.value
+  if (!vp) return
+  pinching = true
+  pinchStartDist = touchDist(e.touches[0], e.touches[1])
+  pinchStartScale = scale.value
+  pinchVpRect = vp.getBoundingClientRect()
+  const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2
+  const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2
+  pinchLastMidX = midX
+  pinchLastMidY = midY
+  // 锁定双指中心指向的内容坐标（当前 scale 布局下测）：
+  // 水平：页面左边缘屏幕 X = rect.left - scrollLeft + TRACK_PAD_LEFT
+  // 垂直：第一页顶部屏幕 Y = rect.top + VIEWPORT_PAD_TOP - scrollTop
+  pinchContentX = (midX - pinchVpRect.left) + vp.scrollLeft - TRACK_PAD_LEFT
+  pinchContentY = (midY - pinchVpRect.top) + vp.scrollTop - VIEWPORT_PAD_TOP
 }
 
 function onTouchMove(e: TouchEvent) {
@@ -679,27 +655,34 @@ function onTouchMove(e: TouchEvent) {
   e.preventDefault()
   const dist = touchDist(e.touches[0], e.touches[1])
   if (pinchStartDist <= 0) return
-  // 仅更新视觉倍率（CSS transform），并把最终真实倍率钳到 [MIN,MAX] 之内，
-  // 避免手势结束后回弹。ratio = 手指张合比例。
+  pinchLastMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2
+  pinchLastMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2
   const ratio = dist / pinchStartDist
-  const clampedFinal = Math.min(MAX_SCALE, Math.max(MIN_SCALE, pinchStartScale * ratio))
-  const vis = clampedFinal / pinchStartScale
-  pinchVisualScale.value = vis
+  pinchPendingScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, pinchStartScale * ratio))
+  schedulePinchFrame()
+}
 
-  // ===== 以双指中心相对缩放的核心 =====
-  // transform-origin 固定 top center。缩放 vis 倍会让焦点 (pinchFocusX,pinchFocusY)
-  // 绕 origin 漂移 focus×(vis-1)，用等量反向 translate 抵消，使双指中心那一点
-  // 在缩放前后钉在屏幕同一物理位置 —— 这就是「从双指位置相对放大」。
-  // 再叠加双指中心自身的位移(手指平移)，让画面跟手拖动，观感自然。
-  const curMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2
-  const curMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2
-  const panX = curMidX - pinchStartMidX
-  const panY = curMidY - pinchStartMidY
-  pinchPanX = panX // 记录，供提交时对齐视觉位置
-  pinchPanY = panY
+// rAF 节流：把高频 touchmove 合并为每帧最多一次「重排 + 锚定」。
+function schedulePinchFrame() {
+  if (pinchRafPending) return
+  pinchRafPending = true
+  requestAnimationFrame(() => {
+    pinchRafPending = false
+    void applyPinchFrame(pinchPendingScale)
+  })
+}
 
-  pinchTx.value = panX - pinchFocusX * (vis - 1)
-  pinchTy.value = panY - pinchFocusY * (vis - 1)
+// 应用一帧缩放：改 scale 触发重排，再用 scroll 让锁定的内容点跟随双指中心。
+async function applyPinchFrame(newScale: number) {
+  const vp = viewportRef.value
+  if (!vp || !pinchVpRect) return
+  const k = newScale / pinchStartScale // 相对手势起点的放大倍率
+  scale.value = newScale
+  recomputeAllSizes()
+  await nextTick() // 等 DOM 按新尺寸重排，scrollWidth/scrollHeight 才是新值
+  // 内容点新坐标 = 旧 × k；让其屏幕位置 = 当前双指中心。
+  vp.scrollTop = pinchContentY * k - (pinchLastMidY - pinchVpRect.top) + VIEWPORT_PAD_TOP
+  vp.scrollLeft = pinchContentX * k - (pinchLastMidX - pinchVpRect.left) + TRACK_PAD_LEFT
 }
 
 function onTouchEnd(e: TouchEvent) {
@@ -707,79 +690,10 @@ function onTouchEnd(e: TouchEvent) {
   if (e.touches.length >= 2) return
   if (!pinching) return
   pinching = false
-
-  const vis = pinchVisualScale.value
-  if (Math.abs(vis - 1) < 1e-3) {
-    // 几乎没缩放，直接复位
-    pinchVisualScale.value = 1
-    return
-  }
-  // 把视觉倍率折算进真实 scale，做一次真实重排 + 重绘（此时才会重新按新
-  // scale 渲染矢量，清晰且不发虚）。用捏合中心作为锚点保持视觉位置稳定。
-  const target = pinchStartScale * vis
-  commitPinchZoom(target)
-}
-
-// 手势结束时提交缩放：清掉临时 transform，按新 scale 真实重排，并让「双指中心
-// 那一点」在提交前后停留在屏幕同一物理位置（水平、垂直都对齐），做到无缝、不跳。
-function commitPinchZoom(newScale: number) {
-  newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, newScale))
-  const vp = viewportRef.value
-  const vis = pinchVisualScale.value
-
-  // ===== 垂直：反解双指中心内容点，定位其所在页与页内比例 =====
-  // pinchFocusY 就是双指中心在「旧(pinchStart)布局、相对内容顶部」的绝对 Y。
-  // 松手时它在视口的物理 Y = pinchAnchorY + pinchPanY（见 onTouchMove 推导）。
-  // 提交后按新布局把这一页内比例重新定位，并让它回到同一物理 Y。
-  let focusPage = currentPage.value
-  let focusRatio = 0
-  {
-    let acc = 0
-    for (let i = 0; i < pages.length; i++) {
-      const h = pages[i].displayHeight + 20
-      if (pinchFocusY >= acc && pinchFocusY < acc + h) {
-        focusPage = i
-        focusRatio = (pinchFocusY - acc) / h
-        break
-      }
-      acc += h
-    }
-  }
-  const screenY = pinchAnchorY + pinchPanY // 松手时双指中心在视口内的垂直位置
-
-  // 清掉临时视觉缩放，切到真实 scale 并重排
-  pinchVisualScale.value = 1
-  pinchTx.value = 0
-  pinchTy.value = 0
-  scale.value = newScale
-  saveLocalScale(newScale) // 记录到本设备本地
-  recomputeAllSizes()
-
-  nextTick(() => {
-    if (vp) {
-      // 垂直：让 focus 页内比例点回到松手时的物理 Y。
-      // screenY 相对 viewport 边框顶部；scrollTop 相对内容区（padding 之后），
-      // 故要扣掉 viewport 上内边距 VIEWPORT_PAD_TOP。
-      let top = 0
-      for (let i = 0; i < focusPage && i < pages.length; i++) top += pages[i].displayHeight + 20
-      top += ((pages[focusPage]?.displayHeight || 0) + 20) * focusRatio
-      vp.scrollTop = Math.max(0, top - screenY + VIEWPORT_PAD_TOP)
-
-      // 水平：内容比视口宽（放大态）时，保持双指水平焦点不跳；否则居中兜底。
-      const extra = vp.scrollWidth - vp.clientWidth
-      if (extra > 0) {
-        // 双指中心相对内容水平中线的新距离 = pinchFocusX × vis；
-        // 松手时它显示在视口 clientWidth/2 + pinchFocusX + pinchPanX 处。
-        const targetScreenX = vp.clientWidth / 2 + pinchFocusX + pinchPanX
-        const contentX = vp.scrollWidth / 2 + pinchFocusX * vis
-        vp.scrollLeft = Math.min(extra, Math.max(0, Math.round(contentX - targetScreenX)))
-      } else {
-        vp.scrollLeft = 0 // 内容不比视口宽，天然居中
-      }
-    }
-    // 按新 scale 重绘已加载页 canvas，矢量重新光栅化 → 放大后依旧锐利
-    rerenderVisible()
-  })
+  pinchVpRect = null
+  // 最终 scale 已在 applyPinchFrame 应用；保存本地并按新 scale 重绘可视页（矢量清晰）。
+  saveLocalScale(scale.value)
+  rerenderVisible()
 }
 
 // ============ 窗口尺寸变化：宽度绑定视口，需重算并重绘 ============
@@ -933,24 +847,9 @@ function close() {
   max-width: 100%;
 }
 
-/* 缩放隔离层：双指手势期间唯一被 transform 缩放的元素。
-   transform-origin 固定「顶部 + 水平居中」，保证：
-   - 放大/缩小始终围绕水平中线展开，内容永远不会跑出左边界导致显示不全；
-   - 缩放产生的视觉溢出被外层 image-viewport 的 contain+overflow 关住，
-     不撑大布局视口，因此不会「变回电脑端样式」。
-   自身 width:100% 且不参与 flex 拉伸，布局盒子尺寸恒定，只有视觉被缩放。 */
-.zoom-layer {
-  width: 100%;
-  /* 让内部 pages-track 在自身宽度内水平居中：track 窄于视口时天然居中，
-   宽于视口（放大态）时靠 centerHorizontally 的 scrollLeft 居中。缺这层
-     flex 居中会导致 track 靠左排、页面不居中。 */
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  transform-origin: top center;
-  will-change: transform;
-}
-
+/* pages-track 是缩放体系的全部：scale 改 displayWidth → track 宽度变化，
+   align-items:center 让页面在 track 内天然居中。不用任何 transform，
+   因此居中逻辑极简、永不会跑偏。 */
 .pages-track {
   display: flex;
   flex-direction: column;
