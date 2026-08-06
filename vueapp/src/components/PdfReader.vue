@@ -418,6 +418,20 @@ function computeDisplaySize(p: PageItem) {
 
 function recomputeAllSizes() {
   for (const p of pages) computeDisplaySize(p)
+  syncTrackWidth()
+}
+
+// 明确设置 track 宽度 = page 宽 + 轨道左右内边距(24)，缩小时至少撑满视口。
+// 不用 CSS max-content：iOS 在白屏重绘/动态内容下不重算，会导致 track 宽度与
+// page 实际宽度不符 → page 居中溢出、左侧滑不到、排版错乱。JS 控宽彻底可控。
+function syncTrackWidth() {
+  nextTick(() => {
+    const track = trackRef.value
+    const vp = viewportRef.value
+    if (!track || !vp || !pages.length) return
+    const pageW = pages[0].displayWidth // 所有页 displayWidth 相同（不依赖 orig 比例）
+    track.style.width = Math.max(pageW + 24, vp.clientWidth) + 'px'
+  })
 }
 
 // ============ 滚动处理 ============
@@ -871,15 +885,16 @@ function close() {
   max-width: 100%;
 }
 
-/* pages-track 是缩放体系的全部：scale 改 displayWidth → track 宽度变化。
-   居中不用 align-items:center —— 那是 flexbox 居中滚动陷阱：page 比 track 宽时
-   会向左右对称溢出，左侧溢出落在负 scrollLeft 区，永远滑不到（放大后左边滑不出）。
-   改用 page 的 margin:0 auto 居中：窄于 track 时均分居中，宽于 track 时 margin 归 0、
-   从左侧对齐，左边缘在 scrollLeft=0 处即可达。不用任何 transform，居中逻辑极简。 */
+/* pages-track 是缩放体系的容器。居中与滚动的可靠性要点（iOS 实战教训）：
+   - 不用 flex 的 align-items:center：宽内容两侧对称溢出，左侧落在负 scrollLeft 区滑不到。
+   - 也不用 flex 上下文里的 margin:auto：iOS 对 flex item 的 auto margin 在溢出时
+     不会可靠归 0 左对齐，会退回居中溢出（白屏重绘的动态窗口里尤其明显）。
+   - 改用「block 布局 + page 的 margin:0 auto」：block auto margin 是最古老可靠的居中，
+     窄时居中、宽时归 0 左对齐，跨浏览器一致（含 iOS）。
+   - track 宽度不依赖 max-content（iOS 对动态内容不重算，白屏窗口会算错），
+     改由 JS(recomputeAllSizes→syncTrackWidth) 按 page 宽度精确设定。 */
 .pages-track {
-  display: flex;
-  flex-direction: column;
-  width: max-content;
+  display: block;
   min-width: 100%;
   box-sizing: border-box;
   padding: 0 12px;
@@ -889,12 +904,11 @@ function close() {
   position: relative;
   background: #fff;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  /* 左右 auto margin 居中：page 比 track 窄时居中，比 track 宽时 margin 收缩为 0、
+  /* block auto margin：page 窄于 track 时居中，宽于 track 时 margin 归 0、
      从 track 左侧对齐 → 左边缘始终可滚动到达（修复放大后左边滑不出）。 */
   margin: 0 auto 20px;
   overflow: hidden;
   contain: layout paint;
-  flex: 0 0 auto;
 }
 
 .page-canvas {
