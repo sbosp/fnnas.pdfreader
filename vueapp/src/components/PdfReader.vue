@@ -871,13 +871,14 @@ function close() {
   max-width: 100%;
 }
 
-/* pages-track 是缩放体系的全部：scale 改 displayWidth → track 宽度变化，
-   align-items:center 让页面在 track 内天然居中。不用任何 transform，
-   因此居中逻辑极简、永不会跑偏。 */
+/* pages-track 是缩放体系的全部：scale 改 displayWidth → track 宽度变化。
+   居中不用 align-items:center —— 那是 flexbox 居中滚动陷阱：page 比 track 宽时
+   会向左右对称溢出，左侧溢出落在负 scrollLeft 区，永远滑不到（放大后左边滑不出）。
+   改用 page 的 margin:0 auto 居中：窄于 track 时均分居中，宽于 track 时 margin 归 0、
+   从左侧对齐，左边缘在 scrollLeft=0 处即可达。不用任何 transform，居中逻辑极简。 */
 .pages-track {
   display: flex;
   flex-direction: column;
-  align-items: center;
   width: max-content;
   min-width: 100%;
   box-sizing: border-box;
@@ -888,7 +889,9 @@ function close() {
   position: relative;
   background: #fff;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  margin: 0 0 20px;
+  /* 左右 auto margin 居中：page 比 track 窄时居中，比 track 宽时 margin 收缩为 0、
+     从 track 左侧对齐 → 左边缘始终可滚动到达（修复放大后左边滑不出）。 */
+  margin: 0 auto 20px;
   overflow: hidden;
   contain: layout paint;
   flex: 0 0 auto;
