@@ -395,9 +395,22 @@ function teardownObserver() {
 // 100% 缩放(scale=1)的定义：页面宽度铺满当前视口可用宽度，
 // 高度按该页真实宽高比(origHeight/origWidth)自适应算出。
 // scale>1 时在此基础上等比放大(可左右拖动看全内容)，scale<1 时缩小居中。
+//
+// 布局基准宽度用「缓存的 stableClientWidth」而非每次实时读 viewport.clientWidth：
+// 实时读取会受横向滚动条显隐(桌面端占位)、iOS 地址栏抖动影响而抖，导致同一帧
+// 不同页算出的 displayWidth 不一致 → 布局错乱。只在 loadMeta 与非豁免 resize 时
+// 刷新基准，手势/按钮缩放全程用同一稳定基准，保证所有页宽度严格一致。
+let stableClientWidth = 0
+
+function refreshStableWidth() {
+  const w = viewportRef.value?.clientWidth || 0
+  if (w > 0) stableClientWidth = w
+}
+
 function computeDisplaySize(p: PageItem) {
-  // 视口可用宽度 = 容器宽度 - 轨道左右内边距(12px×2)
-  const vw = (viewportRef.value?.clientWidth || 800) - 24
+  if (stableClientWidth <= 0) refreshStableWidth()
+  // 视口可用宽度 = 基准宽度 - 轨道左右内边距(12px×2)
+  const vw = (stableClientWidth || 800) - 24
   const ratio = p.origHeight / p.origWidth
   p.displayWidth = Math.round(vw * scale.value)
   p.displayHeight = Math.round(p.displayWidth * ratio)
@@ -489,6 +502,7 @@ async function loadMeta() {
     startFrac.value = typeof data.progress?.frac === 'number' ? data.progress.frac : 0
 
     pages.length = 0
+    refreshStableWidth() // 初始化布局基准宽度
     const metaPages: Array<{ w: number; h: number }> = data.pages || []
     for (let i = 0; i < total.value; i++) {
       const size = metaPages[i]
@@ -624,6 +638,10 @@ let pinchRafPending = false
 let pinchPendingScale = 1
 let pinchVpRect: DOMRect | null = null  // 手势起点缓存的视口 rect（手势期间不变）
 let pinching = false
+// 松手时间戳：iOS 双指捏合/地址栏显隐会冒泡成 window resize，若 handleResize
+// 在手势期间或刚结束时触发，会强制 centerHorizontally + 重算 scrollTop，与双指
+// 锚定公式打架 → 多次缩放后布局错乱。用它给手势后留一段「豁免窗口」隔离 resize。
+let lastPinchEndTime = 0
 
 function touchDist(t0: Touch, t1: Touch) {
   const dx = t0.clientX - t1.clientX
@@ -691,6 +709,7 @@ function onTouchEnd(e: TouchEvent) {
   if (!pinching) return
   pinching = false
   pinchVpRect = null
+  lastPinchEndTime = Date.now() // 标记松手时刻，供 handleResize 豁免判断
   // 最终 scale 已在 applyPinchFrame 应用；保存本地并按新 scale 重绘可视页（矢量清晰）。
   saveLocalScale(scale.value)
   rerenderVisible()
@@ -699,6 +718,10 @@ function onTouchEnd(e: TouchEvent) {
 // ============ 窗口尺寸变化：宽度绑定视口，需重算并重绘 ============
 const handleResize = debounce(() => {
   if (!pages.length) return
+  // 双指手势期间及刚结束的豁免窗口内，忽略 resize：
+  // 此时的 resize 多为 iOS 捏合/地址栏显隐引发的误触发，若照常重排 +
+  // centerHorizontally，会覆盖双指锚定的 scrollTop/scrollLeft，导致布局错乱。
+  if (pinching || Date.now() - lastPinchEndTime < 500) return
   // 记录当前锚点页与页内比例，重算后滚回原位，避免跳动
   const vp = viewportRef.value
   let anchorPage = currentPage.value
@@ -716,6 +739,7 @@ const handleResize = debounce(() => {
       acc += h
     }
   }
+  refreshStableWidth() // 真实 resize：刷新布局基准宽度
   recomputeAllSizes()
   nextTick(() => {
     if (vp) {
