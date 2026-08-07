@@ -124,10 +124,6 @@ const PdfPage = memo(function PdfPage(props: {
         <div
             className="image-page"
             data-page-num={page.pageNum}
-            style={{
-                width: 'var(--pagew)',
-                aspectRatio: `${page.origWidth} / ${page.origHeight}`,
-            }}
         >
             <canvas
                 ref={(el) => setCanvasRef(page.pageNum, el)}
@@ -213,15 +209,27 @@ export default function PdfReader() {
     // 页高 = 页宽 × ratio（ratio = origHeight/origWidth，aspect-ratio 也据此自动撑高）
     const pageDisplayHeight = (p: PageItem) => Math.round(computePageWidth() * p.ratio)
 
-    // 把页宽写进 CSS 变量 --pagew + 精确设定 track 宽度（不靠 max-content，iOS 白屏重绘会算错）。
-    // 这是缩放唯一改 DOM 的地方；page 尺寸由 CSS 变量 + aspect-ratio 自动跟随，零 React 列表重渲染。
+    // 把页宽应用到 track 与每个 page（显式像素），并精确设定 track 宽度。
+    // 关键兼容性决策：page 的宽高用「显式像素」直接设，**不用 CSS 变量 var(--pagew)、也不用
+    // aspect-ratio** —— 这两个较新特性在 fnOS 的 iOS webview（内核可能较老）会失效，导致缩放后
+    // 页面宽度/居中错乱（偏右、左边滑不出）。显式像素最兼容、最可预测；且用 JS 直接改 DOM、
+    // 不经 React state，缩放时不触发列表重渲染（性能与兼容兼得）。
     const applyTrackWidth = () => {
         const track = trackRef.current
         const vp = viewportRef.current
         if (!track || !vp) return
         const pw = computePageWidth()
-        track.style.setProperty('--pagew', pw + 'px')
+        // track 宽度 = 页宽 + 左右 padding(24)，缩小时至少撑满视口（不靠 max-content）。
         track.style.width = Math.max(pw + 24, vp.clientWidth) + 'px'
+        const els = track.querySelectorAll<HTMLElement>('.image-page')
+        els.forEach((el) => {
+            const pn = parseInt(el.dataset.pageNum || '-1', 10)
+            const p = pagesRef.current[pn]
+            if (p) {
+                el.style.width = pw + 'px'
+                el.style.height = Math.round(pw * p.ratio) + 'px'
+            }
+        })
     }
 
     const refreshStableWidth = () => {
@@ -255,6 +263,7 @@ export default function PdfReader() {
                     origHeight: baseViewport.height,
                     ratio: realRatio,
                 })
+                applyTrackWidth() // ratio 变了，按显式像素重算各页高度
             }
         }
 
