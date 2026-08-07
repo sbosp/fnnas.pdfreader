@@ -1,0 +1,377 @@
+/* 书架页（HomePage / Book / Folder / HistoryBook）样式，迁移自 Vue 版各组件 scoped 样式 */
+
+/* ============ 顶部栏 ============ */
+.topbar {
+  height: 52px;
+  flex: 0 0 52px;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  gap: 12px;
+  z-index: 10;
+}
+
+.topbar .brand {
+  font-weight: 600;
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.topbar .brand svg {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+}
+
+.topbar .spacer {
+  flex: 1;
+}
+
+.topbar .user {
+  font-size: 13px;
+  color: var(--sub);
+  cursor: pointer;
+  user-select: none;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* ============ 书架布局 ============ */
+.shelf-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: scroll;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  padding: 18px 22px 28px;
+  overflow-anchor: none;
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.shelf-head {
+  display: flex;
+  align-items: center;
+  margin-bottom: 14px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.shelf-head h2 {
+  font-size: 17px;
+  margin: 0;
+}
+
+.shelf-head .count {
+  color: var(--sub);
+  font-size: 13px;
+}
+
+/* ============ 最近阅读 ============ */
+.recent {
+  margin-bottom: 22px;
+}
+
+.recent .rhead {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.recent .rhead .ricon {
+  color: var(--accent);
+}
+
+.recent-strip {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 2px 10px;
+  scroll-snap-type: x proximity;
+  -webkit-overflow-scrolling: touch;
+}
+
+.recent-strip::-webkit-scrollbar {
+  height: 6px;
+}
+
+.recent-strip::-webkit-scrollbar-thumb {
+  background: #cfd5dd;
+  border-radius: 3px;
+}
+
+.ritem {
+  flex: 0 0 auto;
+  width: 96px;
+  cursor: pointer;
+  scroll-snap-align: start;
+  transition: transform .12s;
+}
+
+.ritem:hover {
+  transform: translateY(-3px);
+}
+
+.ritem .rcover {
+  width: 96px;
+  height: 128px;
+  border-radius: 9px;
+  overflow: hidden;
+  position: relative;
+  background: linear-gradient(135deg, #e9eef7, #dde5f2);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ritem .rcover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  position: absolute;
+  z-index: 2;
+}
+
+.ritem .rcover .rph {
+  color: #b3bccb;
+  position: absolute;
+  z-index: 1;
+}
+
+.ritem .rcover .rph svg {
+  width: 34px;
+  height: 34px;
+}
+
+.ritem .rbar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: rgba(0, 0, 0, .12);
+  z-index: 3;
+}
+
+.ritem .rbar > i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.ritem .rpage {
+  position: absolute;
+  right: 5px;
+  top: 5px;
+  background: rgba(47, 111, 237, .92);
+  color: #fff;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  z-index: 3;
+}
+
+.ritem .rname {
+  font-size: 11px;
+  line-height: 1.3;
+  margin-top: 6px;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  height: 29px;
+}
+
+/* ============ 网格 ============ */
+.grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+}
+
+/* ============ 空状态 ============ */
+.empty {
+  text-align: center;
+  color: var(--sub);
+  padding: 56px 20px;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.empty svg {
+  width: 56px;
+  height: 56px;
+  opacity: .4;
+  display: block;
+  margin: 0 auto 14px;
+}
+
+/* ============ 书籍卡片（Book） ============ */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  transition: transform .12s, box-shadow .12s;
+}
+
+.card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 6px 26px rgba(0, 0, 0, .10);
+}
+
+.cover {
+  aspect-ratio: 3 / 4;
+  background: linear-gradient(135deg, #e9eef7, #dde5f2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  position: absolute;
+  z-index: 2;
+}
+
+.cover .ph {
+  color: #b3bccb;
+  position: absolute;
+  z-index: 1;
+}
+
+.cover .ph svg {
+  width: 46px;
+  height: 46px;
+}
+
+.badge {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  background: rgba(47, 111, 237, .92);
+  color: #fff;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  z-index: 3;
+}
+
+.card .meta {
+  padding: 10px 11px 12px;
+}
+
+.card .title {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  margin: 0 0 4px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 35px;
+}
+
+.card .sub {
+  font-size: 11px;
+  color: var(--sub);
+}
+
+.progressbar {
+  height: 3px;
+  background: #eef0f3;
+  border-radius: 2px;
+  margin-top: 7px;
+  overflow: hidden;
+}
+
+.progressbar > i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+/* ============ 文件夹（Folder） ============ */
+.folder {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  padding: 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: transform .12s, box-shadow .12s;
+}
+
+.folder:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 6px 26px rgba(0, 0, 0, .10);
+}
+
+.folder .ficon svg {
+  width: 46px;
+  height: 46px;
+  display: block;
+}
+
+.folder .fname {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.folder .fsub {
+  font-size: 11px;
+  color: var(--sub);
+}
+
+/* ============ 手机端适配 ============ */
+/* 手机端判定用 pointer: coarse（触屏特征）而非 max-width：避免布局视口被内容/缩放
+   撑过 640px 断点时手机端规则失配、退回电脑样式。 */
+@media (pointer: coarse) {
+  .topbar {
+    padding: 0 10px;
+    gap: 8px;
+  }
+
+  /* 手机端隐藏返回按钮 */
+  .topbar .brand .btn {
+    display: none;
+  }
+
+  /* 手机端收紧品牌文字，给刷新按钮和用户名留出空间 */
+  .topbar .brand {
+    max-width: 40vw;
+    font-size: 14px;
+  }
+}

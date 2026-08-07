@@ -37,10 +37,10 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 echo "Go 版本: $(go version)"
 
-# ---------- Step 1: 编译 Vue 前端 ----------
+# ---------- Step 1: 编译 React 前端 ----------
 echo ""
-echo -e "${YELLOW}[Step 1/3] 编译 Vue 前端...${NC}"
-cd "$PROJECT_ROOT/vueapp"
+echo -e "${YELLOW}[Step 1/3] 编译 React 前端...${NC}"
+cd "$PROJECT_ROOT/reactapp"
 if [ ! -d "node_modules" ]; then
     echo "安装 npm 依赖..."
     npm install
@@ -51,7 +51,7 @@ if [ ! -d "dist" ]; then
     echo -e "${RED}错误: 前端构建失败，dist 目录不存在${NC}"
     exit 1
 fi
-echo -e "${GREEN}Vue 前端编译完成${NC}"
+echo -e "${GREEN}React 前端编译完成${NC}"
 
 # ---------- Step 2: 拷贝前端产物 ----------
 echo ""
