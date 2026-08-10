@@ -292,7 +292,7 @@ func main() {
 	mux.HandleFunc(p+"/api/me", requireUser(handleMe))
 	mux.HandleFunc(p+"/api/books", requireUser(handleBooks))
 	mux.HandleFunc(p+"/api/meta", requireUser(handleMeta))
-	mux.HandleFunc(p+"/api/pagepdf", requireUser(handlePagePDF))
+	mux.HandleFunc(p+"/api/pageimg", requireUser(handlePageImage))
 	mux.HandleFunc(p+"/api/progress", requireUser(handleProgress))
 	mux.HandleFunc(p+"/", serveStatic)
 
