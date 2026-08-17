@@ -60,9 +60,9 @@ func round1(f float64) float64 {
 	return math.Round(f*10) / 10
 }
 
-// parseDocMeta 解析页数 + 每页尺寸（pt，升序）。实现用 go-pdfium（见 render.go）。
-func parseDocMeta(pdfPath string) (*docMeta, error) {
-	return parseDocMetaPdfium(pdfPath)
+// parseDocMeta 解析页数 + 页面尺寸。实现用 go-pdfium（见 render.go），复用渲染 doc 缓存。
+func parseDocMeta(pdfPath, bid string) (*docMeta, error) {
+	return parseDocMetaPdfium(pdfPath, bid)
 }
 
 func handleMeta(w http.ResponseWriter, r *http.Request, u *User) {
@@ -75,7 +75,7 @@ func handleMeta(w http.ResponseWriter, r *http.Request, u *User) {
 
 	meta := loadMetaCache(bid)
 	if meta == nil {
-		m, err := parseDocMeta(entry.Path)
+		m, err := parseDocMeta(entry.Path, bid)
 		if err != nil {
 			logf("meta error %s: %v", entry.Name, err)
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")

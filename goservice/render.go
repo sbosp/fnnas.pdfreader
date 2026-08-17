@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"image/jpeg"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -47,45 +50,38 @@ func initPdfium() error {
 		}
 		pdfiumPool = pool
 		logf("PDFium WASM pool 初始化完成")
+		startDocIdleReaper() // 启动 doc 空闲超时清理（客户端离开/断开后自动释放内存）
 	})
 	return pdfiumErr
 }
 
-// parseDocMetaPdfium 用 go-pdfium 解析页数 + 每页尺寸（pt，升序），替代原 pdfcpu 实现。
-// 有磁盘缓存，仅首次/缓存失效时执行；go-pdfium 渲染与 meta 统一走同一引擎，后端只依赖 go-pdfium。
-func parseDocMetaPdfium(pdfPath string) (*docMeta, error) {
-	if err := initPdfium(); err != nil {
-		return nil, err
-	}
-	instance, err := pdfiumPool.GetInstance(time.Second * 60)
-	if err != nil {
-		return nil, err
-	}
-	defer instance.Close()
+// parseDocMetaPdfium 用 go-pdfium 解析页数 + 页面尺寸。复用渲染的 doc 缓存（getRenderDoc），
+// 且只取第一页尺寸、所有页共用同一 ratio —— 逐页调 FPDF_GetPageSizeByIndex 在 WASM 下每次
+// 都要跨 Go-WASM 边界，373 页就是 373 次调用、远超前端 10s 超时；而绝大多数书页面尺寸统一，
+// 前端 img onLoad 会按 naturalWidth/Height 校正每页真实 ratio，无需逐页精确。
+func parseDocMetaPdfium(pdfPath, bid string) (*docMeta, error) {
+	renderLock.Lock()
+	defer renderLock.Unlock()
 
-	pdfBytes, err := os.ReadFile(pdfPath)
-	if err != nil {
-		return nil, err
-	}
-	doc, err := instance.OpenDocument(&requests.OpenDocument{File: &pdfBytes})
-	if err != nil {
-		return nil, err
-	}
-	defer instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc.Document})
-
-	pc, err := instance.FPDF_GetPageCount(&requests.FPDF_GetPageCount{Document: doc.Document})
+	rd, err := getRenderDoc(pdfPath, bid)
 	if err != nil {
 		return nil, err
 	}
 
-	m := &docMeta{PageCount: pc.PageCount, Pages: make([]PageSize, pc.PageCount)}
-	for i := 0; i < pc.PageCount; i++ {
-		ps, err := instance.FPDF_GetPageSizeByIndex(&requests.FPDF_GetPageSizeByIndex{Document: doc.Document, Index: i})
-		if err == nil && ps.Width > 0 && ps.Height > 0 {
-			m.Pages[i] = PageSize{W: round1(ps.Width), H: round1(ps.Height)}
-		} else {
-			m.Pages[i] = PageSize{W: 612.0, H: 792.0}
+	pc, err := rd.instance.FPDF_GetPageCount(&requests.FPDF_GetPageCount{Document: rd.doc})
+	if err != nil {
+		return nil, err
+	}
+
+	w, h := 612.0, 792.0
+	if pc.PageCount > 0 {
+		if ps, err := rd.instance.FPDF_GetPageSizeByIndex(&requests.FPDF_GetPageSizeByIndex{Document: rd.doc, Index: 0}); err == nil && ps.Width > 0 && ps.Height > 0 {
+			w, h = ps.Width, ps.Height
 		}
+	}
+	m := &docMeta{PageCount: pc.PageCount, Pages: make([]PageSize, pc.PageCount)}
+	for i := range m.Pages {
+		m.Pages[i] = PageSize{W: round1(w), H: round1(h)}
 	}
 	return m, nil
 }
@@ -109,7 +105,8 @@ type renderDoc struct {
 	bid      string
 	instance pdfium.Pdfium
 	doc      references.FPDF_DOCUMENT
-	rendered int // 该 instance 已渲染页数
+	rendered int       // 该 instance 已渲染页数
+	lastUsed time.Time // 最后使用时间（空闲超时清理用）
 }
 
 var (
@@ -118,6 +115,55 @@ var (
 	renderLock sync.Mutex // 渲染互斥：一次只渲染一页
 )
 
+// docIdleTimeout doc 空闲超时：超过此时间没有任何渲染/meta 请求（视为客户端已离开/断开），
+// 后台 reaper 自动关闭 instance 释放内存。HTTP 无状态、无真正「连接断开」事件，用空闲超时近似。
+// 读 PDFR_DOC_IDLE_SECS 环境变量（默认 120s，最小 5s），便于运维调参/测试。
+func docIdleTimeout() time.Duration {
+	if s := os.Getenv("PDFR_DOC_IDLE_SECS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 5 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return 120 * time.Second
+}
+
+// closeCurDocLocked 关闭当前 doc 并释放 instance（销毁 WASM worker 释放内存）。调用方须已持 docCacheMu。
+func closeCurDocLocked() {
+	if curDoc == nil {
+		return
+	}
+	curDoc.instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: curDoc.doc})
+	curDoc.instance.Close()
+	curDoc = nil
+}
+
+// startDocIdleReaper 启动后台 goroutine，定期清理空闲超 docIdleTimeout 的 doc。
+// 先持 renderLock 再清理，确保不在渲染中途关 instance（避免渲染用到已关闭的 instance 崩溃）。
+// 检查间隔取 docIdleTimeout/2（最小 2s），保证空闲超时后能在一个间隔内被发现清理。
+func startDocIdleReaper() {
+	go func() {
+		interval := docIdleTimeout() / 2
+		if interval < 2*time.Second {
+			interval = 2 * time.Second
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			renderLock.Lock()
+			docCacheMu.Lock()
+			if curDoc != nil && time.Since(curDoc.lastUsed) > docIdleTimeout() {
+				logf("doc 空闲超 %v，自动清理释放内存 (bookId=%s)", docIdleTimeout(), curDoc.bid)
+				closeCurDocLocked()
+				// 强制 Go runtime 把空闲内存归还 OS。否则 instance.Close 后 Go heap / Wazero 内存池
+				// 仍保留这些页，进程 footprint 不会下降（逻辑已清理但物理内存没释放）。
+				debug.FreeOSMemory()
+			}
+			docCacheMu.Unlock()
+			renderLock.Unlock()
+		}
+	}()
+}
+
 // getRenderDoc 返回当前书的已打开文档。同书且未超渲染上限则复用（不重新读文件/解析/初始化）；
 // 切换书或超限时关闭旧 instance（销毁 WASM worker、释放累积内存）后重建。
 func getRenderDoc(pdfPath, bid string) (*renderDoc, error) {
@@ -125,13 +171,10 @@ func getRenderDoc(pdfPath, bid string) (*renderDoc, error) {
 	defer docCacheMu.Unlock()
 
 	if curDoc != nil && curDoc.bid == bid && curDoc.rendered < maxRenderPerInstance {
-		return curDoc, nil // 复用：省去读文件 + 解析 + instance 初始化
+		curDoc.lastUsed = time.Now() // 复用：刷新空闲计时
+		return curDoc, nil
 	}
-	if curDoc != nil {
-		curDoc.instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: curDoc.doc})
-		curDoc.instance.Close()
-		curDoc = nil
-	}
+	closeCurDocLocked()
 	if err := initPdfium(); err != nil {
 		return nil, err
 	}
@@ -149,11 +192,29 @@ func getRenderDoc(pdfPath, bid string) (*renderDoc, error) {
 		instance.Close()
 		return nil, err
 	}
-	curDoc = &renderDoc{bid: bid, instance: instance, doc: doc.Document}
+	curDoc = &renderDoc{bid: bid, instance: instance, doc: doc.Document, lastUsed: time.Now()}
 	return curDoc, nil
 }
 
-// renderOnePage 实时渲染单页，返回 JPEG 字节。
+// ----------------------------------------------------------------------------
+// 图片磁盘缓存：存到书库根目录下的隐藏目录 {书库根}/.pdfreader-cache/{bid}/{dpi}/page-N.jpg。
+// 与书籍同盘（通常是大容量存储），隐藏目录不干扰书库浏览；无书库根时回退 DATA_DIR/images。
+// ----------------------------------------------------------------------------
+
+func imageCacheRoot() string {
+	roots := collectRoots()
+	if len(roots) > 0 {
+		return filepath.Join(roots[0], ".pdfreader-cache")
+	}
+	return filepath.Join(cfg.DataDir, "images")
+}
+
+// imagePath 第 page1 页（1-based）对应 dpi 的图片缓存文件
+func imagePath(bid string, page1 int, dpi int) string {
+	return filepath.Join(imageCacheRoot(), bid, strconv.Itoa(dpi), fmt.Sprintf("page-%d.jpg", page1))
+}
+
+// renderOnePage 实时渲染单页，写盘缓存后返回 JPEG 字节。
 func renderOnePage(pdfPath, bid string, page1 int, dpi int) ([]byte, error) {
 	renderLock.Lock()
 	defer renderLock.Unlock()
@@ -177,12 +238,21 @@ func renderOnePage(pdfPath, bid string, page1 int, dpi int) ([]byte, error) {
 	}
 	pr.Cleanup() // WASM 模式必须释放图像资源
 	rd.rendered++
-	return buf.Bytes(), nil
+
+	data := buf.Bytes()
+	// 写盘缓存（书库隐藏目录），下次同页同 dpi 直接读盘
+	ip := imagePath(bid, page1, dpi)
+	if err := os.MkdirAll(filepath.Dir(ip), 0755); err == nil {
+		if err := os.WriteFile(ip, data, 0644); err != nil {
+			logf("图片缓存写盘失败 %s: %v", ip, err)
+		}
+	}
+	return data, nil
 }
 
 // ----------------------------------------------------------------------------
-// 单页图片接口：实时渲染该页并直接返回字节。后端不落盘、不缓存 —— 缓存复用交给
-// 前端浏览器 HTTP 缓存（Cache-Control）。只渲染实际翻阅到的页。
+// 单页图片接口：命中磁盘缓存（书库隐藏目录 .pdfreader-cache）直接读，未命中实时渲染并写盘。
+// 双层缓存复用：后端磁盘缓存（持久）+ 前端浏览器 HTTP 缓存（Cache-Control immutable）。
 // ----------------------------------------------------------------------------
 
 func handlePageImage(w http.ResponseWriter, r *http.Request, u *User) {
@@ -211,11 +281,17 @@ func handlePageImage(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 
-	data, err := renderOnePage(entry.Path, bid, page+1, dpi)
+	page1 := page + 1
+	ip := imagePath(bid, page1, dpi)
+	data, err := os.ReadFile(ip) // 命中磁盘缓存（书库隐藏目录）直接读
 	if err != nil {
-		logf("渲染失败 %s p%d: %v", entry.Name, page+1, err)
-		http.Error(w, "render failed", http.StatusInternalServerError)
-		return
+		// 未命中：实时渲染（renderOnePage 内部已写盘缓存）
+		data, err = renderOnePage(entry.Path, bid, page1, dpi)
+		if err != nil {
+			logf("渲染失败 %s p%d: %v", entry.Name, page1, err)
+			http.Error(w, "render failed", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	logf("%s 实时渲染第 %d 页图片(dpi=%d)耗时 %.3f 秒", bid, page, dpi, time.Since(start).Seconds())
