@@ -13,3 +13,17 @@ registry = "sparse+https://rsproxy.cn/index/"
 # 用系统 git/curl 走网络（复用系统证书，避免个别 SSL 兼容问题）
 [net]
 git-fetch-with-cli = true
+
+# aarch64 Linux（NAS）交叉编译：用 zig 作交叉链接器，无需安装 musl-gcc 工具链。
+# 前置：`brew install zig`（Mac）。构建：
+#   cargo build --release --target aarch64-unknown-linux-musl
+#
+# link-self-contained=no 是关键：zig 自带 musl 的 crt1.o 等启动文件，
+# 若同时链接 Rust 自带的 self-contained crt1.o 会与之符号冲突（_start_c 重复定义）。
+[target.aarch64-unknown-linux-musl]
+linker = "./zig-cc-aarch64-musl.sh"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-self-contained=no",
+]
+

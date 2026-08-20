@@ -1,26 +1,30 @@
 [package]
 name = "pdfserver"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
-description = "PDF Reader backend (Rust) — pure-Rust PDF page extraction over unix socket"
+description = "PDF Reader backend (Rust) — pdf_oxide page rendering over unix socket, path-based API"
 
 [[bin]]
 name = "pdfserver"
 path = "src/main.rs"
 
 [dependencies]
-tiny_http = "0.12"
-# pdf_oxide：纯 Rust PDF 库（MIT/Apache-2.0），DocumentEditor 抽页返回独立单页文档
-pdf_oxide = { version = "0.3", default-features = false, features = ["rendering"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha1 = "0.10"
-hex = "0.4"
+# 并发 HTTP：tiny_http 的 incoming_requests 是串行的，封面/翻页会互相堵。
+# axum+tokio 每请求一个 task；渲染等阻塞活丢到 blocking 线程池。
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# pdf_oxide：纯 Rust PDF 库（MIT/Apache-2.0）。rendering feature 启用 tiny-skia 光栅化，
+# 把 PDF 页渲染成 JPEG；同时提供 page_count / media_box / rotation 供 meta 使用。
+pdf_oxide = { version = "0.3", features = ["rendering"] }
+# image：只用于 CCITT 扫描页的兜底渲染（见 pdfdoc.rs ccitt_page_jpeg）。
+# 版本必须与 pdf_oxide 依赖的一致，否则 to_dynamic_image() 返回的类型接不上。
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 libc = "0.2"
 urlencoding = "2"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+panic = "unwind"

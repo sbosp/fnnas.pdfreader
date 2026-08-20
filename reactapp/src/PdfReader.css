@@ -1,7 +1,9 @@
 /* PdfReader 阅读页样式（迁移自 Vue 版，按 React 新架构调整） */
 
 .reader {
-  height: 100vh;
+  /* 跟随 #root 的 100dvh，不自己写 100vh —— 移动端 100vh 含浏览器工具栏会溢出 */
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   /* 根容器锁定视口宽度并裁掉水平溢出，确保放大产生的横向滚动只发生在 .image-viewport 内。 */
@@ -11,49 +13,61 @@
 }
 
 .reader-toolbar {
-  flex: 0 0 46px;
+  flex: 0 0 48px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 0 14px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
-  overflow-x: auto;
-  overflow-y: hidden;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  gap: 8px;
+  padding: 0 12px;
+  background: rgba(255, 255, 255, .92);
+  backdrop-filter: saturate(180%) blur(12px);
+  border-bottom: 1px solid var(--line, #e3e8f0);
+  overflow: hidden; /* 面包屑内部自己横向滚动，工具栏本身不滚 */
 }
 
-.reader-toolbar::-webkit-scrollbar {
-  display: none;
-  height: 0;
-}
-
-.reader-toolbar > * {
-  flex: 0 0 auto;
-}
-
-.reader-toolbar .doc-title {
-  font-size: 13px;
+/* 书名占据中间弹性空间，过长省略；右侧页码与缩放组固定不被挤压 */
+.reader-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
   font-weight: 500;
-  max-width: 32vw;
+  color: var(--text, #1a2233);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.spacer {
-  flex: 1;
+.pageinfo {
+  flex: none;
+  font-size: 13px;
+  color: var(--text-2, #6b7789);
+  font-variant-numeric: tabular-nums;
 }
 
-.pageinfo {
-  font-size: 14px;
+/* 缩放控件组 */
+.zoomgroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  padding: 2px;
+  border-radius: 10px;
+  background: var(--surface-2, #f0f3f9);
+}
+
+.zoomgroup .iconbtn {
+  width: 28px;
+  height: 28px;
+  background: none;
+  font-size: 15px;
 }
 
 .zoom {
-  min-width: 40px;
+  min-width: 44px;
   text-align: center;
+  font-size: 12px;
+  color: var(--text-2, #6b7789);
+  font-variant-numeric: tabular-nums;
 }
 
 .image-viewport {
@@ -87,11 +101,16 @@
   position: relative;
   background: #fff;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  /* 宽高由内联 style 的 var(--pagew) + aspect-ratio 决定；block auto margin 居中：
+  /* 宽高由 JS（applyTrackWidth）写成显式内联 px —— 不用 CSS 变量/aspect-ratio 做主控，
+     因为 iOS 老 webview 上会失效导致缩放错乱。block auto margin 居中：
      page 窄于 track 时居中，宽于 track 时 margin 归 0、从左侧对齐 → 左边缘可滚动到达。 */
   margin: 0 auto 20px;
   overflow: hidden;
   contain: layout paint;
+  /* 兜底最小高度：万一 JS 尺寸还没写入（首帧、或 iOS resize 豁免路径），
+     也不能塌成 0 高 —— 否则后面几页会叠上来，看起来就像「两页渲染进同一页」。
+     JS 写入内联 height 后会覆盖它（内联样式优先级更高）。 */
+  min-height: 120px;
 }
 
 .page-canvas {
@@ -164,15 +183,43 @@
   backdrop-filter: blur(4px);
 }
 
-/* ============ 手机端适配 ============ */
-/* 手机端判定用 pointer: coarse（触屏特征）而非 max-width：避免布局视口被内容/缩放
-   撑过 640px 断点时手机端规则失配、工具栏重现、页脚消失（退回电脑样式）。 */
-@media (pointer: coarse) {
+/* ============ 平板（640–1023px）============ */
+/* 缩放按钮保留：平板虽支持双指，但触屏笔记本/外接鼠标场景下按钮仍是必要入口。 */
+@media (max-width: 1023px) {
   .reader-toolbar {
+    gap: 6px;
+    padding: 0 10px;
+  }
+
+  .reader-title {
+    font-size: 13px;
+  }
+
+  .zoom {
+    min-width: 40px;
+  }
+}
+
+/* ============ 手机（≤639px）============ */
+@media (max-width: 639px) {
+  .reader-toolbar {
+    flex: 0 0 44px;
+    padding: 0 8px;
+    gap: 4px;
+  }
+
+  /* 手机横向空间紧张：缩放交给双指手势，页码交给底部浮层，
+     工具栏只保留返回 + 书名，避免三组信息互相挤压。 */
+  .zoomgroup,
+  .pageinfo {
     display: none;
   }
 
   .page-footer {
     display: block;
+  }
+
+  .image-viewport {
+    padding: 8px 0;
   }
 }

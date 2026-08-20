@@ -1,6 +1,6 @@
 import {memo, useCallback, useEffect, useRef, useState} from 'react'
-import {useNavigate, useParams} from 'react-router-dom'
-import {request} from '../utils/request'
+import {useLocation, useNavigate} from 'react-router-dom'
+import {pageImgUrl, request} from '../utils/request'
 import {debounce} from '../utils/UIUtils'
 import '../PdfReader.css'
 
@@ -17,9 +17,17 @@ const OBSERVER_ROOT_MARGIN = '800px 0px' // 提前触发加载的缓冲距离
 const KEEP_SCREENS = 2       // 视口上下保留 N 屏的图片，之外卸载防 OOM
 const DEFAULT_PAGE_WIDTH = 595
 const DEFAULT_PAGE_HEIGHT = 842
-const VIEWPORT_PAD_TOP = 12
-const TRACK_PAD_LEFT = 12
-const API_BASE = '/app/fnnas-pdfreader/api'
+
+/** 从 hash 路由 /read/<encodedPath> 取出书籍真实路径 */
+function pathFromLocation(pathname: string): string {
+    const m = pathname.match(/^\/read\/(.*)$/)
+    if (!m) return ''
+    try {
+        return decodeURIComponent(m[1] || '')
+    } catch {
+        return m[1] || ''
+    }
+}
 
 // ============ 缩放比例本地持久化 ============
 function loadLocalScale(): number {
@@ -52,16 +60,28 @@ interface PageItem {
 
 // ============ 单页组件（memo：只有该页状态变化才重渲染）============
 // 宽高由父级 applyTrackWidth 用 JS 直接设显式像素（不经 React），兼容 iOS 老 webview。
+//
+// 【重要】不要把随缩放变化的值（如当前页宽）当 prop 传进来：
+// 那会让每一帧都击穿 memo，373 页的书就是每帧 373 次组件重渲染，双指缩放直接卡死。
+// 初始尺寸改为通过 widthRef（引用恒定，不参与 memo 比较）在渲染时读取。
 const PdfPage = memo(function PdfPage(props: {
     page: PageItem
     imgSrc: string
+    /** 页宽读取器：引用恒定，故不会击穿 memo。仅用于挂载首帧给出尺寸，避免塌成 0 高导致多页重叠 */
+    widthRef: {current: () => number}
     onLoaded: (pn: number, naturalW: number, naturalH: number) => void
     onError: (pn: number) => void
     onRetry: (pn: number) => void
 }) {
-    const {page, imgSrc, onLoaded, onError, onRetry} = props
+    const {page, imgSrc, widthRef, onLoaded, onError, onRetry} = props
+    // 挂载即带显式宽高：避免「JS 还没写入尺寸」的空窗期里 div 塌成 0 高，
+    // 导致多页重叠（看起来像两页渲染进同一页）。applyTrackWidth 之后会精修这两个值。
+    const w = widthRef.current()
+    const initStyle = w > 0
+        ? {width: w + 'px', height: Math.round(w * page.ratio) + 'px'}
+        : undefined
     return (
-        <div className="image-page" data-page-num={page.pageNum}>
+        <div className="image-page" data-page-num={page.pageNum} style={initStyle}>
             {page.shouldLoad && (
                 <img
                     className="page-img"
@@ -94,7 +114,8 @@ const PdfPage = memo(function PdfPage(props: {
 })
 
 export default function PdfReader() {
-    const {bookId = ''} = useParams()
+    const location = useLocation()
+    const bookPath = pathFromLocation(location.pathname)
     const navigate = useNavigate()
     const viewportRef = useRef<HTMLDivElement>(null)
     const trackRef = useRef<HTMLDivElement>(null)
@@ -112,13 +133,20 @@ export default function PdfReader() {
     const totalRef = useRef(0)
     const startFracRef = useRef(0)
     const stableClientWidthRef = useRef(0)
+    // 视口高度快照：与宽度一样避免手势中反复读 DOM 触发布局
+    const stableClientHeightRef = useRef(0)
     const ioRef = useRef<IntersectionObserver | null>(null)
     const initializedRef = useRef(false)
     const pendingInitRef = useRef<{ page: number, frac: number } | null>(null)
 
-    // 双指手势状态
+    // 双指手势状态。
+    //
+    // 锚点用「页号 + 页内相对位置」记录，不用文档绝对坐标：绝对坐标乘缩放比推算新位置
+    // 会越翻越偏 —— 页间距固定 20px 不随缩放变化，而手势中 applyTrackWidth(true)
+    // 只更新视口附近页的尺寸，锚点上方的页高度根本没变。
     const pinchRef = useRef({
-        startDist: 0, startScale: 1, contentX: 0, contentY: 0,
+        startDist: 0, startScale: 1,
+        anchorPage: 0, anchorFracX: 0, anchorFracY: 0,
         lastMidX: 0, lastMidY: 0, pendingScale: 1, rafPending: false,
         vpRect: null as DOMRect | null, pinching: false, lastEndTime: 0,
     })
@@ -126,6 +154,14 @@ export default function PdfReader() {
     const setScale = (v: number) => {
         scaleRef.current = v
         setScaleState(v)
+    }
+    /**
+     * 双指手势进行中只更新 ref，不碰 React state。
+     * scale 唯一的 state 用途是工具栏那个百分比文字，没必要为它每帧重渲染整个阅读器；
+     * 手势结束时 setScale 同步一次即可。
+     */
+    const setScaleFast = (v: number) => {
+        scaleRef.current = v
     }
     const setPages = (arr: PageItem[]) => {
         pagesRef.current = arr
@@ -144,28 +180,136 @@ export default function PdfReader() {
     }
     const pageDisplayHeight = (p: PageItem) => Math.round(computePageWidth() * p.ratio)
 
+    // 页宽读取器：引用恒定，作为 prop 传给 memo 化的 PdfPage 也不会击穿 memo
+    const pageWidthGetterRef = useRef<() => number>(() => 0)
+    pageWidthGetterRef.current = computePageWidth
+
+    // 缓存 .image-page 元素列表，避免每帧 querySelectorAll 全量扫描
+    const pageElsCacheRef = useRef<{count: number, els: HTMLElement[]}>({count: 0, els: []})
+    const pageEls = (): HTMLElement[] => {
+        const track = trackRef.current
+        if (!track) return []
+        const cache = pageElsCacheRef.current
+        const n = pagesRef.current.length
+        // 页数变化（换书/加载完成）时才重新查询
+        if (cache.count !== n || cache.els.length !== n) {
+            cache.els = Array.from(track.querySelectorAll<HTMLElement>('.image-page'))
+            cache.count = n
+        }
+        return cache.els
+    }
+
     // 用「显式像素」设每页宽高 + track 宽度（不用 CSS 变量/aspect-ratio，兼容 iOS 老 webview）。
     // JS 直接改 DOM 不经 React state，缩放零列表重渲染。
-    const applyTrackWidth = () => {
+    //
+    // visibleOnly=true（双指缩放每帧调用）：只更新视口附近的页。
+    //   大书全量更新代价太高（373 页 = 746 次样式写入/帧），而当帧只有几页可见。
+    //   远处页在手势结束时由 visibleOnly=false 的那次调用补齐。
+    // centerPage：指定更新区间的中心页。双指缩放传锚点页进来，一是保证锚点页一定被
+    //   更新到（anchorScrollTo 要读它的新尺寸），二是省掉一次 vp.scrollTop 读取 ——
+    //   写完 track 宽度再读会触发强制同步布局。
+    const applyTrackWidth = (visibleOnly = false, centerPage?: number) => {
         const track = trackRef.current
         const vp = viewportRef.current
         if (!track || !vp) return
         const pw = computePageWidth()
-        track.style.width = Math.max(pw + 24, vp.clientWidth) + 'px'
-        const els = track.querySelectorAll<HTMLElement>('.image-page')
-        els.forEach((el) => {
-            const pn = parseInt(el.dataset.pageNum || '-1', 10)
-            const p = pagesRef.current[pn]
-            if (p) {
-                el.style.width = pw + 'px'
-                el.style.height = Math.round(pw * p.ratio) + 'px'
+
+        // 先把需要读的布局值一次读完，再统一写，避免「写→读→写」触发强制同步布局
+        const clientW = stableClientWidthRef.current || vp.clientWidth
+        track.style.width = Math.max(pw + 24, clientW) + 'px'
+
+        const list = pagesRef.current
+        const els = pageEls()
+        if (!els.length) return
+
+        // 计算需要精确更新的页区间
+        let from = 0
+        let to = els.length - 1
+        if (visibleOnly) {
+            // 用「最矮页」的比例估算单页高度：高度估小 → 反推的页号偏大不会偏小，
+            // 配合 span 冗余可保证真正可见的页一定落在区间内（各页比例不同的书也安全，
+            // 例如封面竖版 + 内页横版的双页扫描书）。
+            let minRatio = Infinity
+            for (let i = 0; i < list.length; i++) {
+                const r = list[i]?.ratio
+                if (r && r < minRatio) minRatio = r
             }
-        })
+            if (!isFinite(minRatio) || minRatio <= 0) minRatio = 1.414
+            const approxH = Math.round(pw * minRatio) + 20
+            const center = centerPage ?? (approxH > 0 ? Math.floor(vp.scrollTop / approxH) : 0)
+            // 视口最多能放几页（按最矮页算，取上界）+ 冗余
+            const perScreen = approxH > 0 ? Math.ceil((stableClientHeightRef.current || vp.clientHeight) / approxH) : 1
+            const span = Math.max(3, perScreen + 2)
+            from = Math.max(0, center - span)
+            to = Math.min(els.length - 1, center + span)
+        }
+
+        for (let i = from; i <= to; i++) {
+            const el = els[i]
+            if (!el) continue
+            const pn = parseInt(el.dataset.pageNum || '-1', 10)
+            const p = list[pn]
+            if (!p) continue
+            const h = Math.round(pw * p.ratio)
+            // 只在值变化时写，减少无谓的样式失效
+            const wPx = pw + 'px'
+            const hPx = h + 'px'
+            if (el.style.width !== wPx) el.style.width = wPx
+            if (el.style.height !== hPx) el.style.height = hPx
+        }
+    }
+
+    // ============ 缩放锚点 ============
+    // 都直接用页元素的真实布局位置（offsetTop/offsetLeft，相对定位的 .image-viewport），
+    // 不按缩放比推算：页间距、pages-track 的 padding、页窄于 track 时 margin:auto 的
+    // 居中偏移，这些都不随缩放线性变化，自己算一个都不能漏。
+
+    /** anchorFromPoint 把视口内一点换算成「页号 + 页内相对位置」*/
+    const anchorFromPoint = (clientX: number, clientY: number, rect: DOMRect) => {
+        const vp = viewportRef.current
+        const els = pageEls()
+        const fallback = {page: 0, fracX: 0.5, fracY: 0}
+        if (!vp || !els.length) return fallback
+        const contentX = (clientX - rect.left) + vp.scrollLeft
+        const contentY = (clientY - rect.top) + vp.scrollTop
+        // 找第一个底边越过该点的页（手势开始时布局是稳定的，直接信 DOM）
+        let page = els.length - 1
+        for (let i = 0; i < els.length; i++) {
+            if (els[i].offsetTop + els[i].offsetHeight > contentY) {
+                page = i
+                break
+            }
+        }
+        const el = els[page]
+        if (!el || !el.offsetWidth || !el.offsetHeight) return fallback
+        const clamp01 = (v: number) => Math.min(1, Math.max(0, v))
+        return {
+            page,
+            // 落在页间距里时会被夹到边缘，视觉上等价
+            fracX: clamp01((contentX - el.offsetLeft) / el.offsetWidth),
+            fracY: clamp01((contentY - el.offsetTop) / el.offsetHeight),
+        }
+    }
+
+    /** anchorScrollTo 滚动到「让锚点重新落在 (clientX, clientY) 」的位置 */
+    const anchorScrollTo = (
+        page: number, fracX: number, fracY: number,
+        clientX: number, clientY: number, rect: DOMRect,
+    ) => {
+        const vp = viewportRef.current
+        const el = pageEls()[page]
+        if (!vp || !el) return
+        // offsetTop/offsetLeft 是不受滚动影响的静态布局位置，正好就是滚动内容坐标系
+        vp.scrollTop = el.offsetTop + fracY * el.offsetHeight - (clientY - rect.top)
+        vp.scrollLeft = el.offsetLeft + fracX * el.offsetWidth - (clientX - rect.left)
     }
 
     const refreshStableWidth = () => {
-        const w = viewportRef.current?.clientWidth || 0
+        const vp = viewportRef.current
+        const w = vp?.clientWidth || 0
+        const h = vp?.clientHeight || 0
         if (w > 0) stableClientWidthRef.current = w
+        if (h > 0) stableClientHeightRef.current = h
     }
 
     // ============ 图片加载回调 ============
@@ -232,16 +376,23 @@ export default function PdfReader() {
     }, [])
 
     // ============ 滚动处理 ============
+    // 用 ref 持有最新的书路径/书名，避免 debounce 闭包捕获旧值
+    const bookPathRef = useRef(bookPath)
+    bookPathRef.current = bookPath
+    const bookNameRef = useRef(bookName)
+    bookNameRef.current = bookName
+
     const saveProgress = useRef(debounce(async (pageNum: number, fraction: number) => {
-        if (!bookId) return
+        const p = bookPathRef.current
+        if (!p) return
         try {
-            await request.post(`progress?id=${bookId}`, {
+            await request.post(`progress?path=${encodeURIComponent(p)}`, {
                 page: pageNum,
                 frac: fraction,
-                name: bookName,
+                name: bookNameRef.current,
                 scale: scaleRef.current,
                 totalPages: totalRef.current,
-                percent: ((pageNum + 1) / totalRef.current * 100).toFixed(2),
+                percent: Number(((pageNum + 1) / Math.max(1, totalRef.current) * 100).toFixed(2)),
             }, {headers: {'Content-Type': 'application/json'}})
         } catch (e) {
             console.warn('保存进度失败', e)
@@ -267,29 +418,53 @@ export default function PdfReader() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [saveProgress])
 
-    // 回收：滚出视口上下 N 屏的页卸载 img，释放解码位图防 OOM（翻回由 observer 重新加载，走 HTTP 缓存）
+    // 回收：滚出视口上下 N 屏的页卸载 img，释放解码位图防 OOM（翻回由 observer 重新请求，命中后端磁盘缓存）
+    //
+    // 必须用页元素的真实 offsetTop/Height，不能用 pageDisplayHeight 累加：
+    // 双指缩放中 applyTrackWidth(true) 只改了附近页的尺寸，远处页还是旧高度，
+    // 按「全页已是新比例」推位置会把正在看的页算到视口外 → 卸 img → 松手后重新加载。
     const scheduleUnloadInvisible = useRef(debounce(() => {
+        const S = pinchRef.current
+        if (S.pinching || Date.now() - S.lastEndTime < 800) return
         const vp = viewportRef.current
         if (!vp) return
         const scrollTop = vp.scrollTop
-        const viewBottom = scrollTop + vp.clientHeight
-        const buffer = vp.clientHeight * KEEP_SCREENS
-        let acc = 0
-        const list = pagesRef.current
+        const viewH = stableClientHeightRef.current || vp.clientHeight
+        const lo = scrollTop - viewH * KEEP_SCREENS
+        const hi = scrollTop + viewH + viewH * KEEP_SCREENS
         const keep = new Set<number>()
-        for (let i = 0; i < list.length; i++) {
-            const h = pageDisplayHeight(list[i]) + 20
-            if (acc + h >= scrollTop - buffer && acc <= viewBottom + buffer) keep.add(i)
-            acc += h
-        }
-        for (const p of list) {
-            if (!keep.has(p.pageNum) && p.shouldLoad) {
-                updatePage(p.pageNum, {shouldLoad: false, loaded: false})
+        const els = pageEls()
+        if (els.length) {
+            for (let i = 0; i < els.length; i++) {
+                const el = els[i]
+                const top = el.offsetTop
+                if (top + el.offsetHeight >= lo && top <= hi) {
+                    const pn = parseInt(el.dataset.pageNum || '-1', 10)
+                    if (pn >= 0) keep.add(pn)
+                }
+            }
+        } else {
+            let acc = 0
+            const list = pagesRef.current
+            for (let i = 0; i < list.length; i++) {
+                const h = pageDisplayHeight(list[i]) + 20
+                if (acc + h >= lo && acc <= hi) keep.add(i)
+                acc += h
             }
         }
+        const list = pagesRef.current
+        let changed = false
+        const next = list.map(p => {
+            if (keep.has(p.pageNum) || !p.shouldLoad) return p
+            changed = true
+            return {...p, shouldLoad: false, loaded: false}
+        })
+        if (changed) setPages(next)
     }, 300)).current
 
     const handleScroll = useCallback(() => {
+        // 双指缩放每帧都在改 scrollTop，这里若跟着跑会把「卸载」误触发在半新半旧布局上
+        if (pinchRef.current.pinching) return
         updateCurrentPageFromScroll()
         scheduleUnloadInvisible()
     }, [updateCurrentPageFromScroll, scheduleUnloadInvisible])
@@ -317,12 +492,15 @@ export default function PdfReader() {
 
     // ============ 元数据加载 ============
     const loadMeta = useCallback(async () => {
+        if (!bookPath) return
         try {
-            // meta（页数+尺寸，immutable 长缓存）与 progress（阅读进度，实时）分开请求：
-            // meta 可被浏览器长缓存，progress 必须实时，否则「继续阅读」会停在旧进度。
+            // meta（页数+尺寸）与 progress（阅读进度）并行请求。
+            // 两者都不走浏览器缓存（后端 no-store），后端改动/换书能立即生效；
+            // 页面图片的复用靠后端磁盘缓存（书库 .pdfreader-cache），不依赖浏览器缓存。
+            const pq = encodeURIComponent(bookPath)
             const [metaRes, progRes] = await Promise.all([
-                request.get(`meta?id=${bookId}`),
-                request.get(`progress?id=${bookId}`),
+                request.get(`meta?path=${pq}`),
+                request.get(`progress?path=${pq}`),
             ])
             const data = metaRes.data
             const prog = progRes.data?.progress
@@ -336,11 +514,11 @@ export default function PdfReader() {
             startFracRef.current = startFrac
 
             refreshStableWidth()
-            const metaPages: Array<{ w: number; h: number }> = data.pages || []
+            // 后端只返回首页尺寸（所有页共用），每页真实比例由 img onLoad 校正
+            const w = data.width || DEFAULT_PAGE_WIDTH
+            const h = data.height || DEFAULT_PAGE_HEIGHT
             const list: PageItem[] = []
             for (let i = 0; i < cnt; i++) {
-                const w = metaPages[i]?.w || DEFAULT_PAGE_WIDTH
-                const h = metaPages[i]?.h || DEFAULT_PAGE_HEIGHT
                 list.push({
                     pageNum: i,
                     origWidth: w,
@@ -353,12 +531,11 @@ export default function PdfReader() {
             }
             setPages(list)
             pendingInitRef.current = {page: startPage, frac: startFrac}
-            console.log('📚 PDF 阅读器已初始化（图片方案）', {文档: data.name, 总页数: cnt, 起始页: startPage + 1})
         } catch (e) {
             console.error('加载文档元数据失败', e)
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [bookId])
+    }, [bookPath])
 
     // ============ 首次初始化 ============
     useEffect(() => {
@@ -381,28 +558,16 @@ export default function PdfReader() {
             applyTrackWidth()
             return
         }
-        const anchorY = vp.clientHeight / 2
-        const scrollTop = vp.scrollTop
-        const focus = scrollTop + anchorY
-        const list = pagesRef.current
-        let acc = 0, anchorPage = 0, anchorRatio = 0
-        for (let i = 0; i < list.length; i++) {
-            const h = pageDisplayHeight(list[i]) + 20
-            if (focus >= acc && focus < acc + h) {
-                anchorPage = i
-                anchorRatio = (focus - acc) / h
-                break
-            }
-            acc += h
-        }
+        // 以视口正中为锚点，缩放前后都用真实布局定位（同双指缩放）
+        const rect = vp.getBoundingClientRect()
+        const cx = rect.left + vp.clientWidth / 2
+        const cy = rect.top + vp.clientHeight / 2
+        const a = anchorFromPoint(cx, cy, rect)
         setScale(newScale)
         saveLocalScale(newScale)
         applyTrackWidth()
-        let top = 0
-        for (let i = 0; i < anchorPage && i < list.length; i++) top += pageDisplayHeight(list[i]) + 20
-        top += ((list[anchorPage] ? pageDisplayHeight(list[anchorPage]) : 0) + 20) * anchorRatio
-        vp.scrollTop = Math.max(0, top - anchorY)
-        centerHorizontally()
+        anchorScrollTo(a.page, a.fracX, a.fracY, cx, cy, rect)
+        centerHorizontally()  // 按钮缩放的横向行为是保持居中，覆盖掉横向锚点
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [centerHorizontally])
 
@@ -427,23 +592,28 @@ export default function PdfReader() {
         S.startDist = touchDist(e.touches[0], e.touches[1])
         S.startScale = scaleRef.current
         S.vpRect = vp.getBoundingClientRect()
+        // 只刷高度快照（用于估算可见页区间）。**不能刷宽度**——
+        // stableClientWidthRef 是 computePageWidth 的基准，手势中途变更会让页宽突变。
+        stableClientHeightRef.current = vp.clientHeight || stableClientHeightRef.current
         const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2
         const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2
         S.lastMidX = midX
         S.lastMidY = midY
-        S.contentX = (midX - S.vpRect.left) + vp.scrollLeft - TRACK_PAD_LEFT
-        S.contentY = (midY - S.vpRect.top) + vp.scrollTop - VIEWPORT_PAD_TOP
+        const a = anchorFromPoint(midX, midY, S.vpRect)
+        S.anchorPage = a.page
+        S.anchorFracX = a.fracX
+        S.anchorFracY = a.fracY
     }
 
+    // 手势中的每一帧：全程不碰 React state、只更新可见页、写操作集中在末尾。
     const applyPinchFrame = (newScale: number) => {
         const vp = viewportRef.current
         const S = pinchRef.current
         if (!vp || !S.vpRect) return
-        const k = newScale / S.startScale
-        setScale(newScale)
-        applyTrackWidth()
-        vp.scrollTop = S.contentY * k - (S.lastMidY - S.vpRect.top) + VIEWPORT_PAD_TOP
-        vp.scrollLeft = S.contentX * k - (S.lastMidX - S.vpRect.left) + TRACK_PAD_LEFT
+        setScaleFast(newScale)                   // 只写 ref，零重渲染
+        applyTrackWidth(true, S.anchorPage)      // 只更新锚点页附近
+        // 锚点跟随双指中点移动，所以缩放的同时也能平移
+        anchorScrollTo(S.anchorPage, S.anchorFracX, S.anchorFracY, S.lastMidX, S.lastMidY, S.vpRect)
     }
 
     const schedulePinchFrame = () => {
@@ -474,8 +644,15 @@ export default function PdfReader() {
         const S = pinchRef.current
         if (!S.pinching) return
         S.pinching = false
-        S.vpRect = null
         S.lastEndTime = Date.now()
+        // 手势结束：补齐所有页的精确尺寸（手势中只更新了视口附近页），
+        // 并把 scale 同步进 React state（工具栏百分比、以及依赖 scale 的逻辑）。
+        applyTrackWidth(false)
+        // 补齐会改掉锚点页上方那些页的高度、从而挪动锚点页的布局位置，
+        // 必须再对位一次，否则松手瞬间会跳一下。
+        if (S.vpRect) anchorScrollTo(S.anchorPage, S.anchorFracX, S.anchorFracY, S.lastMidX, S.lastMidY, S.vpRect)
+        S.vpRect = null
+        setScale(scaleRef.current)
         saveLocalScale(scaleRef.current)
     }
 
@@ -534,22 +711,28 @@ export default function PdfReader() {
             setPages([])
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [bookId])
+    }, [bookPath])
 
     const close = () => navigate(-1)
     const zoomLabel = `${Math.round(scale * 100)}%`
 
     return (
         <div className="reader">
-            {/* 工具栏（手机端隐藏）*/}
+            {/* 工具栏 */}
             <div className="reader-toolbar">
-                <button className="btn btn-back" onClick={close}>← 返回</button>
-                <span className="doc-title">{bookName}</span>
-                <div className="spacer"/>
+                <button className="iconbtn" onClick={close} title="返回">
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M15 5l-7 7 7 7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
+                              strokeLinejoin="round"/>
+                    </svg>
+                </button>
+                <h1 className="reader-title" title={bookName}>{bookName}</h1>
                 <span className="pageinfo">{currentPage + 1} / {total}</span>
-                <button className="btn" onClick={zoomOut}>－</button>
-                <span className="zoom">{zoomLabel}</span>
-                <button className="btn" onClick={zoomIn}>＋</button>
+                <div className="zoomgroup">
+                    <button className="iconbtn" onClick={zoomOut} title="缩小">－</button>
+                    <span className="zoom">{zoomLabel}</span>
+                    <button className="iconbtn" onClick={zoomIn} title="放大">＋</button>
+                </div>
             </div>
 
             {/* 视口 */}
@@ -559,7 +742,8 @@ export default function PdfReader() {
                         <PdfPage
                             key={page.pageNum}
                             page={page}
-                            imgSrc={`${API_BASE}/pageimg?id=${encodeURIComponent(bookId)}&page=${page.pageNum}`}
+                            imgSrc={pageImgUrl(bookPath, page.pageNum)}
+                            widthRef={pageWidthGetterRef}
                             onLoaded={onLoaded}
                             onError={onError}
                             onRetry={retryPage}

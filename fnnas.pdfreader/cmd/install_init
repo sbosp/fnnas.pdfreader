@@ -1,3 +1,4 @@
 #!/bin/bash
-
+killall -9 pdfserver 2>/dev/null || true
+rm -f "${TRIM_PKGVAR}/pdfreader.lock" "${TRIM_PKGVAR}/pdfreader.pid" 2>/dev/null || true
 exit 0

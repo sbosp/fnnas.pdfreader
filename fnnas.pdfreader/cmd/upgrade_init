@@ -1,3 +1,5 @@
 #!/bin/bash
-
+# 升级前清掉旧进程。不要用 flock：旧版锁还在的话，stop 会失败，新包装不进去。
+killall -9 pdfserver 2>/dev/null || true
+rm -f "${TRIM_PKGVAR}/pdfreader.lock" "${TRIM_PKGVAR}/pdfreader.pid" "${TRIM_APPDEST}/app.sock" 2>/dev/null || true
 exit 0

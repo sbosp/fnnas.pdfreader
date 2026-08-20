@@ -1,377 +1,748 @@
-/* 书架页（HomePage / Book / Folder / HistoryBook）样式，迁移自 Vue 版各组件 scoped 样式 */
+/* ============================================================================
+   PDF 阅读器 — 书库页样式
+   设计：卡片式书架 + 路径导航条。
 
-/* ============ 顶部栏 ============ */
+   适配分三档宽度（基准样式即 PC，向下逐档覆盖）：
+     PC    ≥1024px   书架 auto-fill 多列
+     平板  640–1023px 同样 auto-fill，只收紧留白
+     手机  ≤639px    固定双列紧凑布局
+
+   断点按宽度而非 (pointer: coarse)：后者会把平板、触屏笔记本、触屏一体机上的
+   fnOS 桌面全判成手机。当初避开宽度断点是担心 PDF 缩放撑大布局视口，现在
+   index.html 已 user-scalable=no，且 .image-viewport 用 contain:layout 把横向
+   溢出关在容器内，布局视口不会被撑大，宽度断点是安全的。
+   触屏只用于交互细节（见 hover:hover 包裹的悬停态），不参与布局判定。
+
+   注意：应用是在 fnOS 桌面的 iframe 里运行，媒体查询量的是 iframe 视口，
+   用户可以把窗口拖窄，所以 PC 端也必须能在窄宽度下成立。
+   ========================================================================== */
+
+:root {
+    --bg: #f5f7fb;
+    --surface: #ffffff;
+    --surface-2: #f0f3f9;
+    --line: #e3e8f0;
+    --text: #1a2233;
+    --text-2: #6b7789;
+    --text-3: #9aa5b6;
+    --brand: #2f6fed;
+    --brand-weak: #e8f0fe;
+    --radius: 14px;
+    --radius-sm: 10px;
+    /* 书架列宽：书籍和文件夹各占 1 列，左右边缘对齐 */
+    --col: 124px;
+    --col-gap: 12px;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 4px 14px rgba(16, 24, 40, .05);
+    --shadow-hover: 0 4px 10px rgba(16, 24, 40, .08), 0 12px 28px rgba(16, 24, 40, .10);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html, body, #root {
+    height: 100%;
+    margin: 0;
+}
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font: 400 14px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
+}
+
+button {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: 0;
+    cursor: pointer;
+}
+
+/* 书库页自己就是滚动容器。
+   注意 overflow-x: hidden 会让另一轴的 visible 按规范计算成 auto，.page 因此必然
+   是个滚动容器；若让 #root 滚动，sticky 就锚在永不滚动的 .page 上、吸顶失效。
+   所以纵向滚动放在这里，同时省掉 #root 上的 :has() 选择器（老 WebView 不支持）。 */
+.page {
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    /* 书库页永不横向滚动：任何子元素意外超宽都不该让整页能左右拖动 */
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* ---------------------------------------------------------------- 顶部栏 */
+/* 顶栏与路径导航条整体吸顶：放在同一个 sticky 容器里，导航条就不需要硬编码
+   top 偏移（原先手算 topbar 高度 = 内边距 + 按钮 + 边框，改任一处就会露缝或重叠）。 */
+.page-head {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+}
+
 .topbar {
-  height: 52px;
-  flex: 0 0 52px;
-  display: flex;
-  align-items: center;
-  padding: 0 16px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
-  gap: 12px;
-  z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    background: rgba(255, 255, 255, .88);
+    backdrop-filter: saturate(180%) blur(12px);
+    border-bottom: 1px solid var(--line);
 }
 
-.topbar .brand {
-  font-weight: 600;
-  font-size: 15px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+.brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 500;
+    color: var(--brand);
+    cursor: pointer;
+    flex: none;
 }
 
-.topbar .brand svg {
-  width: 20px;
-  height: 20px;
-  flex: 0 0 auto;
+.brand svg {
+    width: 22px;
+    height: 22px;
 }
 
-.topbar .spacer {
-  flex: 1;
+.brand-name {
+    font-size: 15px;
+    color: var(--text);
 }
 
-.topbar .user {
-  font-size: 13px;
-  color: var(--sub);
-  cursor: pointer;
-  user-select: none;
-  flex: 0 0 auto;
-  white-space: nowrap;
+.search {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    max-width: 420px;
+    padding: 0 10px;
+    background: var(--surface-2);
+    border: 1px solid transparent;
+    border-radius: 999px;
+    transition: border-color .15s, background .15s;
 }
 
-/* ============ 书架布局 ============ */
-.shelf-wrap {
-  flex: 1;
-  min-height: 0;
-  overflow-y: scroll;
-  overflow-x: hidden;
-  scrollbar-gutter: stable;
-  padding: 18px 22px 28px;
-  overflow-anchor: none;
-  overscroll-behavior: none;
-  -webkit-overflow-scrolling: touch;
+.search:focus-within {
+    background: var(--surface);
+    border-color: var(--brand);
 }
 
-.shelf-head {
-  display: flex;
-  align-items: center;
-  margin-bottom: 14px;
-  gap: 12px;
-  flex-wrap: wrap;
+.search svg {
+    width: 16px;
+    height: 16px;
+    color: var(--text-3);
+    flex: none;
 }
 
-.shelf-head h2 {
-  font-size: 17px;
-  margin: 0;
+.search input {
+    flex: 1;
+    min-width: 0;
+    height: 34px;
+    border: 0;
+    outline: 0;
+    background: none;
+    font-size: 13px;
+    color: var(--text);
 }
 
-.shelf-head .count {
-  color: var(--sub);
-  font-size: 13px;
+.search-clear {
+    width: 20px;
+    height: 20px;
+    line-height: 18px;
+    border-radius: 50%;
+    color: var(--text-2);
+    background: rgba(0, 0, 0, .06);
+    flex: none;
 }
 
-/* ============ 最近阅读 ============ */
-.recent {
-  margin-bottom: 22px;
+.iconbtn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    color: var(--text-2);
+    background: var(--surface-2);
+    transition: background .15s, color .15s;
+    flex: none;
 }
 
-.recent .rhead {
-  font-size: 14px;
-  font-weight: 600;
-  margin: 0 0 10px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+/* 悬停态一律关在 hover:hover 里：触屏点击后 :hover 会粘住不散，
+   卡片会一直停在抬起状态、图标按钮一直高亮。 */
+@media (hover: hover) {
+    .iconbtn:hover {
+        background: var(--brand-weak);
+        color: var(--brand);
+    }
 }
 
-.recent .rhead .ricon {
-  color: var(--accent);
+/* 搜索框到 420px 就停止伸展，剩余空间会留在行尾 ——
+   这里把刷新按钮起的右侧一组顶到右边。手机端搜索框铺满，auto 自然失效。 */
+.topbar .iconbtn {
+    margin-left: auto;
 }
 
+.iconbtn svg {
+    width: 18px;
+    height: 18px;
+}
+
+.user {
+    padding: 5px 12px;
+    border-radius: 999px;
+    background: var(--brand-weak);
+    color: var(--brand);
+    font-size: 12px;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: none;
+    cursor: default;
+}
+
+/* ------------------------------------------------------- 路径导航条（面包屑） */
+.crumb-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+}
+
+.backbtn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    color: var(--text-2);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    flex: none;
+}
+
+.backbtn svg {
+    width: 16px;
+    height: 16px;
+}
+
+.crumb {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+}
+
+.crumb::-webkit-scrollbar {
+    display: none;
+}
+
+.crumb-seg {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex: none;
+}
+
+.crumb-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 8px;
+    border-radius: 7px;
+    color: var(--text-2);
+    font-size: 13px;
+    white-space: nowrap;
+    /* 用固定上限而不是 vw：宽屏下 40vw 有 500px+，单个层级能吃掉半条导航 */
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background .15s, color .15s;
+}
+
+@media (hover: hover) {
+    .crumb-item:hover:not(.is-current) {
+        background: var(--brand-weak);
+        color: var(--brand);
+    }
+}
+
+.crumb-item.is-current {
+    color: var(--text);
+    font-weight: 500;
+    cursor: default;
+}
+
+.crumb-home svg {
+    width: 15px;
+    height: 15px;
+}
+
+.crumb-sep {
+    width: 13px;
+    height: 13px;
+    color: var(--text-3);
+    flex: none;
+}
+
+/* ---------------------------------------------------------------- 内容区 */
+.content {
+    flex: 1;
+    padding: 16px 16px 40px;
+    max-width: 1400px;
+    width: 100%;
+    margin: 0 auto;
+}
+
+.sect {
+    margin-bottom: 26px;
+}
+
+.sect-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 12px;
+}
+
+.sect-head h2 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--text);
+}
+
+.count {
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 12px;
+}
+
+.alert {
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    border-radius: var(--radius-sm);
+    background: #fdecec;
+    color: #a3312f;
+    font-size: 13px;
+}
+
+/* ------------------------------------------------------------ 最近阅读横条 */
 .recent-strip {
-  display: flex;
-  gap: 12px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding: 2px 2px 10px;
-  scroll-snap-type: x proximity;
-  -webkit-overflow-scrolling: touch;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    overflow-x: auto;
+    padding: 2px 2px 8px;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
 }
 
-.recent-strip::-webkit-scrollbar {
-  height: 6px;
-}
-
-.recent-strip::-webkit-scrollbar-thumb {
-  background: #cfd5dd;
-  border-radius: 3px;
-}
-
+/* 默认 align-items:stretch 会把每项拉到最高项的高度，而 button 内容默认垂直居中，
+   于是书名行数少的项封面被推下去。flex-start + 纵向 flex 布局让封面一律顶对齐。 */
 .ritem {
-  flex: 0 0 auto;
-  width: 96px;
-  cursor: pointer;
-  scroll-snap-align: start;
-  transition: transform .12s;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    width: 104px;
+    text-align: left;
+    padding: 0;
 }
 
-.ritem:hover {
-  transform: translateY(-3px);
+.rcover {
+    position: relative;
+    width: 104px;
+    aspect-ratio: 3 / 4;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: var(--surface-2);
+    box-shadow: var(--shadow);
 }
 
-.ritem .rcover {
-  width: 96px;
-  height: 128px;
-  border-radius: 9px;
-  overflow: hidden;
-  position: relative;
-  background: linear-gradient(135deg, #e9eef7, #dde5f2);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.rcover img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: top center;
+    display: block;
 }
 
-.ritem .rcover img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-  position: absolute;
-  z-index: 2;
+.rph {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: var(--text-3);
 }
 
-.ritem .rcover .rph {
-  color: #b3bccb;
-  position: absolute;
-  z-index: 1;
+.rph svg {
+    width: 28px;
+    height: 28px;
 }
 
-.ritem .rcover .rph svg {
-  width: 34px;
-  height: 34px;
+.rpage {
+    position: absolute;
+    right: 5px;
+    bottom: 8px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, .6);
+    color: #fff;
+    font-size: 11px;
 }
 
-.ritem .rbar {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 3px;
-  background: rgba(0, 0, 0, .12);
-  z-index: 3;
+.rbar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3px;
+    background: rgba(0, 0, 0, .12);
 }
 
-.ritem .rbar > i {
-  display: block;
-  height: 100%;
-  background: var(--accent);
+.rbar i {
+    display: block;
+    height: 100%;
+    background: var(--brand);
 }
 
-.ritem .rpage {
-  position: absolute;
-  right: 5px;
-  top: 5px;
-  background: rgba(47, 111, 237, .92);
-  color: #fff;
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  z-index: 3;
+.rname {
+    margin: 6px 0 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
 }
 
-.ritem .rname {
-  font-size: 11px;
-  line-height: 1.3;
-  margin-top: 6px;
-  color: var(--text);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  height: 29px;
+.rdir {
+    margin: 2px 0 0;
+    font-size: 11px;
+    color: var(--text-3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
-/* ============ 网格 ============ */
+/* ---------------------------------------------------------------- 网格 */
+/* 书籍和文件夹共用同一套列轨道，各占 1 列，左右边缘对齐。 */
 .grid {
-  display: grid;
-  gap: 16px;
-  grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(var(--col), 1fr));
+    gap: var(--col-gap);
 }
 
-/* ============ 空状态 ============ */
-.empty {
-  text-align: center;
-  color: var(--sub);
-  padding: 56px 20px;
-  font-size: 14px;
-  line-height: 1.7;
+/* 网格直接子项统一允许收缩：否则长文件名会撑破列宽造成整页横向滚动 */
+.grid > * {
+    min-width: 0;
 }
 
-.empty svg {
-  width: 56px;
-  height: 56px;
-  opacity: .4;
-  display: block;
-  margin: 0 auto 14px;
+/* 骨架屏 */
+.skel {
+    aspect-ratio: 3 / 5.6;
+    border-radius: var(--radius);
+    background: linear-gradient(100deg, var(--surface-2) 30%, #e7ebf3 50%, var(--surface-2) 70%);
+    background-size: 200% 100%;
+    animation: sk 1.2s linear infinite;
 }
 
-/* ============ 书籍卡片（Book） ============ */
+@keyframes sk {
+    to {
+        background-position: -200% 0;
+    }
+}
+
+/* ---------------------------------------------------------------- 书籍卡片 */
 .card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  cursor: pointer;
-  box-shadow: var(--shadow);
-  transition: transform .12s, box-shadow .12s;
+    display: block;
+    padding: 0;
+    text-align: left;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+    transition: transform .16s, box-shadow .16s;
+    min-width: 0;
+    max-width: 100%;
 }
 
-.card:hover {
-  transform: translateY(-3px);
-  box-shadow: 0 6px 26px rgba(0, 0, 0, .10);
+@media (hover: hover) {
+    .card:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-hover);
+    }
+}
+
+.card:active {
+    transform: translateY(0);
 }
 
 .cover {
-  aspect-ratio: 3 / 4;
-  background: linear-gradient(135deg, #e9eef7, #dde5f2);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  overflow: hidden;
+    position: relative;
+    aspect-ratio: 3 / 4;
+    background: var(--surface-2);
+    overflow: hidden;
 }
 
 .cover img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-  position: absolute;
-  z-index: 2;
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    /* 顶部对齐裁切：PDF 首页上半部通常是标题，比整页缩小更像书封 */
+    object-fit: cover;
+    object-position: top center;
+    display: block;
 }
 
-.cover .ph {
-  color: #b3bccb;
-  position: absolute;
-  z-index: 1;
+.ph {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: var(--text-3);
 }
 
-.cover .ph svg {
-  width: 46px;
-  height: 46px;
+.ph svg {
+    width: 34px;
+    height: 34px;
 }
 
 .badge {
-  position: absolute;
-  left: 8px;
-  bottom: 8px;
-  background: rgba(47, 111, 237, .92);
-  color: #fff;
-  font-size: 11px;
-  padding: 2px 7px;
-  border-radius: 999px;
-  z-index: 3;
+    position: absolute;
+    top: 7px;
+    right: 7px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, .62);
+    color: #fff;
+    font-size: 11px;
 }
 
-.card .meta {
-  padding: 10px 11px 12px;
+.cover-bar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3px;
+    background: rgba(0, 0, 0, .12);
 }
 
-.card .title {
-  font-size: 13px;
-  font-weight: 500;
-  line-height: 1.35;
-  margin: 0 0 4px;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  min-height: 35px;
+.cover-bar i {
+    display: block;
+    height: 100%;
+    background: var(--brand);
 }
 
-.card .sub {
-  font-size: 11px;
-  color: var(--sub);
+.meta {
+    padding: 8px 9px 10px;
 }
 
-.progressbar {
-  height: 3px;
-  background: #eef0f3;
-  border-radius: 2px;
-  margin-top: 7px;
-  overflow: hidden;
+.title {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--text);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
 }
 
-.progressbar > i {
-  display: block;
-  height: 100%;
-  background: var(--accent);
+.sub {
+    margin: 3px 0 0;
+    font-size: 11px;
+    color: var(--text-3);
 }
 
-/* ============ 文件夹（Folder） ============ */
+/* ---------------------------------------------------------------- 文件夹 */
+/* 上图标、下标题：和书籍卡片同一列宽，标题固定两行以免卡片高度参差。 */
 .folder {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  cursor: pointer;
-  box-shadow: var(--shadow);
-  padding: 16px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  transition: transform .12s, box-shadow .12s;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    padding: 0;
+    text-align: left;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    transition: transform .16s, box-shadow .16s;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
 }
 
-.folder:hover {
-  transform: translateY(-3px);
-  box-shadow: 0 6px 26px rgba(0, 0, 0, .10);
+@media (hover: hover) {
+    .folder:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-hover);
+    }
 }
 
-.folder .ficon svg {
-  width: 46px;
-  height: 46px;
-  display: block;
+.folder:active {
+    transform: translateY(0);
 }
 
-.folder .fname {
-  font-size: 13px;
-  font-weight: 500;
-  line-height: 1.35;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+.ficon {
+    display: grid;
+    place-items: center;
+    aspect-ratio: 1;
+    background: var(--surface-2);
 }
 
-.folder .fsub {
-  font-size: 11px;
-  color: var(--sub);
+.ficon svg {
+    width: 48px;
+    height: 48px;
+    display: block;
 }
 
-/* ============ 手机端适配 ============ */
-/* 手机端判定用 pointer: coarse（触屏特征）而非 max-width：避免布局视口被内容/缩放
-   撑过 640px 断点时手机端规则失配、退回电脑样式。 */
-@media (pointer: coarse) {
-  .topbar {
-    padding: 0 10px;
-    gap: 8px;
-  }
+.fmeta {
+    min-width: 0;
+    padding: 8px 9px 10px;
+}
 
-  /* 手机端隐藏返回按钮 */
-  .topbar .brand .btn {
-    display: none;
-  }
+.fname {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--text);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
 
-  /* 手机端收紧品牌文字，给刷新按钮和用户名留出空间 */
-  .topbar .brand {
-    max-width: 40vw;
+.fsub {
+    margin: 3px 0 0;
+    font-size: 11px;
+    color: var(--text-3);
+}
+
+/* ---------------------------------------------------------------- 空态 */
+.empty {
+    display: grid;
+    place-items: center;
+    gap: 6px;
+    padding: 60px 20px;
+    color: var(--text-2);
+    text-align: center;
+}
+
+.empty svg {
+    width: 46px;
+    height: 46px;
+    color: var(--text-3);
+}
+
+.empty p {
+    margin: 0;
     font-size: 14px;
-  }
+}
+
+.empty .hint {
+    max-width: 460px;
+    font-size: 12px;
+    color: var(--text-3);
+    line-height: 1.7;
+}
+
+/* ==================================================== 平板（640–1023px）*/
+/* 书架网格本身用 auto-fill，列数会自动跟着宽度走，这里只收紧留白与文字上限。
+   原先手机端判定用 (pointer: coarse)，平板和触屏笔记本会被误判成手机、
+   被强制成两列 —— 1400px 宽也只排 2 列，卡片大得离谱。改成宽度断点后消失。 */
+@media (max-width: 1023px) {
+    .content {
+        padding: 14px 14px 36px;
+    }
+
+    .search {
+        max-width: 320px;
+    }
+
+    .crumb-item {
+        max-width: 30vw;
+    }
+}
+
+/* ======================================================== 手机（≤639px）*/
+@media (max-width: 639px) {
+    .topbar {
+        gap: 8px;
+        padding: 8px 12px;
+    }
+
+    .brand-name {
+        display: none; /* 手机端只留图标，给搜索框腾空间 */
+    }
+
+    .search {
+        max-width: none;
+    }
+
+    .user {
+        max-width: 74px;
+        padding: 4px 9px;
+    }
+
+    .crumb-bar {
+        padding: 7px 12px;
+    }
+
+    .crumb-item {
+        max-width: 46vw;
+        font-size: 12px;
+        padding: 4px 7px;
+    }
+
+    .content {
+        padding: 12px 12px 32px;
+    }
+
+    .sect {
+        margin-bottom: 20px;
+    }
+
+    /* 手机三列书架：封面够大又能一屏看到多本 */
+    .grid {
+        grid-template-columns: repeat(3, 1fr);
+        gap: 10px;
+    }
+
+    .ritem, .rcover {
+        width: 88px;
+    }
+
+    .title, .fname {
+        font-size: 12px;
+    }
+
+    .ficon svg {
+        width: 40px;
+        height: 40px;
+    }
 }

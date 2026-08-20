@@ -1,164 +1,280 @@
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
-import {useNavigate, useParams} from 'react-router-dom'
+import {useLocation, useNavigate} from 'react-router-dom'
 import {request} from '../utils/request'
+import Breadcrumb, {Crumb} from './Breadcrumb'
 import Folder from './Folder'
 import Book from './Book'
 import HistoryBook from './HistoryBook'
 
-// 轻量比较签名：列表长度 + 每项 id/类型/进度，用于判断网络数据与当前显示是否一致
-function sigOf(list: any[]) {
-    return (list || []).map(b => `${b.id}:${b.type || ''}:${b.page ?? ''}:${b.pageCount ?? ''}`).join('|')
+export interface Item {
+    name: string
+    path: string
+    type: 'file' | 'folder'
+    size: number
+    mtime: number
+    count: number
+    segments: string[]
+    progress?: {
+        page: number
+        frac: number
+        totalPages: number
+        percent: number
+        updatedAt: number
+    }
+}
+
+/** 从 hash 路由 /browse/<encodedPath> 取出真实路径 */
+function pathFromLocation(pathname: string): string {
+    const m = pathname.match(/^\/browse\/(.*)$/)
+    if (!m) return ''
+    try {
+        return decodeURIComponent(m[1] || '')
+    } catch {
+        return m[1] || ''
+    }
 }
 
 export default function HomePage() {
     const navigate = useNavigate()
-    const {folderId = ''} = useParams()
-    const [allBooks, setAllBooks] = useState<any[]>([])
-    const [recentBooks, setRecentBooks] = useState<any[]>([])
+    const location = useLocation()
+    const curPath = pathFromLocation(location.pathname)
+
+    const [items, setItems] = useState<Item[]>([])
+    const [crumbs, setCrumbs] = useState<Crumb[]>([])
+    const [recent, setRecent] = useState<Item[]>([])
     const [username, setUsername] = useState('')
+    const [loading, setLoading] = useState(false)
+    const [err, setErr] = useState('')
+    const [keyword, setKeyword] = useState('')
 
-    // 目录数据内存缓存：key=folderId('' 表示根)，返回上一级时立即命中，避免异步空窗闪动
-    const pageCacheRef = useRef(new Map<string, { books: any[], history: any[], username: string }>())
-    // 当前显示数据快照，用于「缓存命中且网络一致则跳过赋值」
-    const snapRef = useRef({books: [] as any[], history: [] as any[], username: ''})
+    // 目录数据内存缓存：返回上一级时立即命中，避免异步空窗闪动
+    const cacheRef = useRef(new Map<string, { items: Item[], crumbs: Crumb[], username: string }>())
+    const lastFetchAt = useRef(0)
 
-    // 连点 5 次「用户」启用 vconsole
-    const userClickCount = useRef(0)
-    const userClickTimer = useRef<number | null>(null)
+    // 连点 5 次「用户名」启用 vconsole（真机排障）
+    const clickN = useRef(0)
+    const clickT = useRef<number | null>(null)
     const onUserClick = () => {
-        userClickCount.current++
-        if (userClickTimer.current) clearTimeout(userClickTimer.current)
-        userClickTimer.current = window.setTimeout(() => {
-            userClickCount.current = 0
-        }, 2000)
-        if (userClickCount.current >= 5) {
-            userClickCount.current = 0
-            if (userClickTimer.current) {
-                clearTimeout(userClickTimer.current)
-                userClickTimer.current = null
-            }
+        clickN.current++
+        if (clickT.current) clearTimeout(clickT.current)
+        clickT.current = window.setTimeout(() => (clickN.current = 0), 2000)
+        if (clickN.current >= 5) {
+            clickN.current = 0
             const fn = (window as any).__enableVConsole
             if (typeof fn === 'function') Promise.resolve(fn()).then(() => console.log('✅ vConsole 已启用'))
         }
     }
 
-    const refreshPage = useCallback((scan = "", path = '') => {
-        if (path === '') path = folderId || ''
-        let hitCache = false
-        if (scan !== 'all') {
-            const cached = pageCacheRef.current.get(path)
-            if (cached) {
-                hitCache = true
-                snapRef.current = cached
-                setAllBooks(cached.books)
-                setRecentBooks(cached.history)
-                setUsername(cached.username)
-            }
+    const loadList = useCallback((p: string, force = false) => {
+        // 书库根（空 path）不走内存缓存：授权目录增删后回到首页必须立刻看到新列表
+        const cached = !p ? undefined : cacheRef.current.get(p)
+        if (cached && !force) {
+            setItems(cached.items)
+            setCrumbs(cached.crumbs)
+            setUsername(cached.username)
+        } else {
+            setLoading(true)
         }
-        request.get(`books?path=${path}&scan=${scan}`).then((data) => {
-            const books = data.data.books || []
-            const history = data.data.history || []
-            const uname = data.data.username || '用户'
-            pageCacheRef.current.set(path, {books, history, username: uname})
-            // 命中缓存且网络数据与当前一致时跳过赋值，避免二次渲染闪动
-            const cur = snapRef.current
-            if (hitCache && uname === cur.username
-                && sigOf(books) === sigOf(cur.books)
-                && sigOf(history) === sigOf(cur.history)) return
-            snapRef.current = {books, history, username: uname}
-            setAllBooks(books)
-            setRecentBooks(history)
-            setUsername(uname)
-        }).catch((err) => {
-            console.error('❌ books请求失败:', err)
-        })
-    }, [folderId])
+        setErr('')
+        lastFetchAt.current = Date.now()
+        request.get(`list?path=${encodeURIComponent(p)}`).then((res) => {
+            const d = res.data
+            const next = {
+                items: (d.items || []) as Item[],
+                crumbs: (d.breadcrumb || []) as Crumb[],
+                username: d.username || '用户',
+            }
+            cacheRef.current.set(p, next)
+            setItems(next.items)
+            setCrumbs(next.crumbs)
+            setUsername(next.username)
+        }).catch((e) => {
+            setErr(e?.response?.status === 404 ? '目录不存在或已被移除' : '加载失败，请重试')
+        }).finally(() => setLoading(false))
+    }, [])
+
+    const loadRecent = useCallback(() => {
+        request.get('recent').then((res) => {
+            setRecent((res.data.items || []) as Item[])
+        }).catch(() => setRecent([]))
+    }, [])
 
     useEffect(() => {
-        refreshPage()
-    }, [refreshPage])
+        loadList(curPath)
+    }, [curPath, loadList])
 
-    // 计算当前层级的数据（文件夹 / 文件分组）
-    const currentLevel = useMemo(() => {
-        const folders: any[] = []
-        const files: any[] = []
-        allBooks.forEach((b) => {
-            if (b.type === 'folder') folders.push(b)
-            else if (b.type === 'file') files.push(b)
-        })
-        return {folders, files}
-    }, [allBooks])
+    useEffect(() => {
+        loadRecent()
+    }, [loadRecent, curPath])
 
-    const refreshClick = () => {
-        navigate('/')
-        refreshPage('all')
+    // 从应用设置回到页面时 iframe 通常还活着。只在「重新可见」时强刷，
+    // 不在 pageshow 首屏再打一遍（会和上面的 loadList 叠成两次，接口一慢就像打不开）。
+    useEffect(() => {
+        const onVis = () => {
+            if (document.visibilityState !== 'visible') return
+            // iframe 刚挂上时有的 WebView 会立刻 fire visible，跟 mount 的 loadList 叠两次
+            if (Date.now() - lastFetchAt.current < 1500) return
+            cacheRef.current.clear()
+            loadList(curPath, true)
+            loadRecent()
+        }
+        document.addEventListener('visibilitychange', onVis)
+        return () => document.removeEventListener('visibilitychange', onVis)
+    }, [curPath, loadList, loadRecent])
+
+    const {folders, files} = useMemo(() => {
+        const kw = keyword.trim().toLowerCase()
+        const match = (it: Item) => !kw || it.name.toLowerCase().includes(kw)
+        return {
+            folders: items.filter(i => i.type === 'folder' && match(i)),
+            files: items.filter(i => i.type === 'file' && match(i)),
+        }
+    }, [items, keyword])
+
+    const openBook = (it: Item) => navigate(`/read/${encodeURIComponent(it.path)}`)
+    const enterFolder = (it: Item) => navigate(`/browse/${encodeURIComponent(it.path)}`)
+    const goPath = (p: string) => navigate(`/browse/${encodeURIComponent(p)}`)
+    const goHome = () => navigate('/')
+    const refresh = () => {
+        cacheRef.current.clear()
+        loadList(curPath, true)
+        loadRecent()
     }
-    const openBook = (book: any) => navigate(`/reader/${book.id}`)
-    const enterFolder = (folder: any) => navigate(`/folder/${folder.id}`)
-    const back = () => navigate(-1)
+    const canBack = crumbs.length > 1
 
     return (
-        <>
-            {/* 顶部栏 */}
-            <div className="topbar">
-        <span className="brand">
-          <button className="btn" onClick={back}>← 返回</button>
-          <svg viewBox="0 0 24 24" fill="none">
-            <path d="M6 2h8l4 4v16H6z" stroke="#2f6fed" strokeWidth="1.6" strokeLinejoin="round"/>
-            <path d="M14 2v4h4" stroke="#2f6fed" strokeWidth="1.6" strokeLinejoin="round"/>
-            <path d="M8.5 13h7M8.5 16.5h7M8.5 9.5h3" stroke="#2f6fed" strokeWidth="1.4" strokeLinecap="round"/>
-          </svg>
-          PDF 阅读器
-        </span>
-                <div className="spacer"></div>
-                <button className="btn icon" onClick={refreshClick} title="刷新书库">刷新</button>
-                <span className="user" onClick={onUserClick}>{username}</span>
+        <div className="page">
+            {/* 顶栏 + 路径导航条整体吸顶 */}
+            <div className="page-head">
+                {/* 顶部栏 */}
+                <header className="topbar">
+                    <div className="brand" onClick={goHome} role="button">
+                        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <path d="M6 2h8l4 4v16H6z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/>
+                            <path d="M14 2v4h4" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/>
+                            <path d="M8.5 13h7M8.5 16.5h7M8.5 9.5h3" stroke="currentColor" strokeWidth="1.4"
+                                  strokeLinecap="round"/>
+                        </svg>
+                        <span className="brand-name">PDF 阅读器</span>
+                    </div>
+
+                    <div className="search">
+                        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <circle cx="11" cy="11" r="6.5" stroke="currentColor" strokeWidth="1.6"/>
+                            <path d="M16 16l4.5 4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/>
+                        </svg>
+                        <input
+                            value={keyword}
+                            onChange={(e) => setKeyword(e.target.value)}
+                            placeholder="筛选当前目录…"
+                            aria-label="筛选当前目录"
+                        />
+                        {keyword && (
+                            <button className="search-clear" onClick={() => setKeyword('')} aria-label="清空">×</button>
+                        )}
+                    </div>
+
+                    <button className="iconbtn" onClick={refresh} title="刷新">
+                        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <path d="M20 12a8 8 0 1 1-2.5-5.8" stroke="currentColor" strokeWidth="1.7"
+                                  strokeLinecap="round"/>
+                            <path d="M20 4v4.5h-4.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"
+                                  strokeLinejoin="round"/>
+                        </svg>
+                    </button>
+                    <span className="user" onClick={onUserClick} title={username}>{username}</span>
+                </header>
+
+                {/* 路径导航条 */}
+                <div className="crumb-bar">
+                    {canBack && (
+                        <button className="backbtn" onClick={() => navigate(-1)} title="返回上一级">
+                            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <path d="M15 5l-7 7 7 7" stroke="currentColor" strokeWidth="1.8"
+                                      strokeLinecap="round" strokeLinejoin="round"/>
+                            </svg>
+                        </button>
+                    )}
+                    <Breadcrumb crumbs={crumbs} onNavigate={goPath} onHome={goHome}/>
+                </div>
             </div>
 
-            {/* 书架内容 */}
-            <div className="shelf-wrap">
+            <main className="content">
                 {/* 最近阅读 */}
-                {recentBooks.length > 0 && (
-                    <div className="recent">
-                        <p className="rhead"><span className="ricon">🕘</span> 最近阅读</p>
+                {recent.length > 0 && !keyword && (
+                    <section className="sect">
+                        <div className="sect-head">
+                            <h2>继续阅读</h2>
+                        </div>
                         <div className="recent-strip">
-                            {recentBooks.map((book) => (
-                                <div key={book.id} className="ritem" onClick={() => openBook(book)}>
-                                    <HistoryBook book={book}/>
-                                </div>
+                            {recent.map((b) => (
+                                <button className="ritem" key={b.path} onClick={() => openBook(b)}>
+                                    <HistoryBook book={b}/>
+                                </button>
                             ))}
                         </div>
+                    </section>
+                )}
+
+                {err && <div className="alert">{err}</div>}
+
+                {loading && items.length === 0 && (
+                    <div className="grid">
+                        {Array.from({length: 8}).map((_, i) => <div className="skel" key={i}/>)}
                     </div>
                 )}
 
-                <div className="shelf-head">
-                    <h2>我的书架</h2>
-                    {allBooks.length > 0 && <span className="count">共 {allBooks.length} 个</span>}
-                </div>
-                {allBooks.length === 0 && (
+                {/* 文件夹 */}
+                {folders.length > 0 && (
+                    <section className="sect">
+                        <div className="sect-head">
+                            <h2>文件夹</h2>
+                            <span className="count">{folders.length}</span>
+                        </div>
+                        <div className="grid grid-folder">
+                            {folders.map((f) => (
+                                <Folder key={f.path} folder={f} onClick={() => enterFolder(f)}/>
+                            ))}
+                        </div>
+                    </section>
+                )}
+
+                {/* 书籍 */}
+                {files.length > 0 && (
+                    <section className="sect">
+                        <div className="sect-head">
+                            <h2>书籍</h2>
+                            <span className="count">{files.length}</span>
+                        </div>
+                        <div className="grid">
+                            {files.map((b) => (
+                                <Book key={b.path} book={b} onClick={() => openBook(b)}/>
+                            ))}
+                        </div>
+                    </section>
+                )}
+
+                {/* 空态 */}
+                {!loading && !err && folders.length === 0 && files.length === 0 && (
                     <div className="empty">
-                        <svg viewBox="0 0 24 24" fill="none">
+                        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
                             <path d="M4 5h16v14H4z" stroke="currentColor" strokeWidth="1.4"/>
                             <path d="M9 5v14" stroke="currentColor" strokeWidth="1.4"/>
                         </svg>
-                        书架还是空的。<br/>请在「文件管理 → 应用文件 → PDF 阅读器 → PDFLibrary」中放入 PDF（可建子文件夹），<br/>或在「应用设置
-                        → 允许访问的文件夹」中添加目录，然后点右上角「⟳ 刷新」。
+                        {keyword ? (
+                            <p>没有匹配「{keyword}」的内容</p>
+                        ) : (
+                            <>
+                                <p>这里还没有 PDF</p>
+                                <p className="hint">
+                                    在「文件管理 → 应用文件 → PDF 阅读器 → PDFLibrary」放入 PDF（可建子文件夹），
+                                    或在应用设置里添加允许访问的文件夹，然后点右上角刷新。
+                                </p>
+                            </>
+                        )}
                     </div>
                 )}
-                <div className="grid">
-                    {/* 书籍 */}
-                    {currentLevel.files.map((book) => (
-                        <Book key={book.id} book={book} onClick={() => openBook(book)}/>
-                    ))}
-                </div>
-                <div style={{height: 16}}/>
-                <div className="grid">
-                    {/* 文件夹 */}
-                    {currentLevel.folders.map((folder) => (
-                        <Folder key={folder.id} folder={folder} onClick={() => enterFolder(folder)}/>
-                    ))}
-                </div>
-            </div>
-        </>
+            </main>
+        </div>
     )
 }
