@@ -35,5 +35,13 @@ tmp/
 temp/
 *.tmp
 
+# Native PDFium SDK + local CGO build artifacts
+goservice/third_party/pdfium/
+goservice/pdfserver
+goservice/pdfium-worker
+goservice/lib/
+goservice/*.jpg
+goservice/*.webp
+
 # PyInstaller
 pyservice/*.spec

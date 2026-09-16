@@ -5,6 +5,8 @@
 ###############################################################################
 
 SERVER="${TRIM_APPDEST}/server/pdfserver"
+WORKER="${TRIM_APPDEST}/server/pdfium-worker"
+LIB_DIR="${TRIM_APPDEST}/server/lib"
 SOCK_PATH="${TRIM_APPDEST}/app.sock"
 PID_FILE="${TRIM_PKGVAR}/pdfreader.pid"
 LOG_FILE="${TRIM_PKGVAR}/pdfreader.log"
@@ -19,6 +21,12 @@ export PDFR_DATA_DIR="${TRIM_PKGVAR}/data"
 export PDFR_SHARE_PATHS="${TRIM_DATA_SHARE_PATHS}"
 export PDFR_ACCESSIBLE_PATHS="${TRIM_DATA_ACCESSIBLE_PATHS}"
 export PDFR_ROOTS_FILE="${TRIM_PKGVAR}/roots.txt"
+export PDFR_PDFIUM_WORKER="${WORKER}"
+export PDFR_PDFIUM_LIB="${LIB_DIR}"
+# 兜底：无 rpath 时仍能找到 libpdfium.so
+if [ -d "${LIB_DIR}" ]; then
+    export LD_LIBRARY_PATH="${LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 write_roots_file() {
     mkdir -p "${TRIM_PKGVAR}" 2>/dev/null
@@ -59,9 +67,17 @@ start_process() {
     if [ ! -x "${SERVER}" ]; then
         chmod +x "${SERVER}" 2>/dev/null || true
     fi
+    if [ ! -x "${WORKER}" ]; then
+        chmod +x "${WORKER}" 2>/dev/null || true
+    fi
     if [ ! -f "${SERVER}" ]; then
         echo "PDF 服务二进制文件缺失：${SERVER}，启动失败。" > "${TRIM_TEMP_LOGFILE}"
         log_msg "server missing: ${SERVER}"
+        return 1
+    fi
+    if [ ! -f "${WORKER}" ]; then
+        echo "PDFium worker 缺失：${WORKER}，启动失败。" > "${TRIM_TEMP_LOGFILE}"
+        log_msg "worker missing: ${WORKER}"
         return 1
     fi
 

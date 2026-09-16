@@ -5,15 +5,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
 
-// ----------------------------------------------------------------------------
-// 阅读进度持久化（按 uid 存 progress/{uid}.json，原子替换）
-// ----------------------------------------------------------------------------
-
-// progressEntry 阅读进度。Percent 用 any 兼容前端 toFixed 字符串或数字。
+// progressEntry 阅读进度。key 为书籍真实绝对路径。
 type progressEntry struct {
 	Page       int     `json:"page"`
 	Frac       float64 `json:"frac,omitempty"`
@@ -48,16 +45,15 @@ func loadProgress(uid string) map[string]*progressEntry {
 	return m
 }
 
-func saveProgressEntry(uid, bid string, entry *progressEntry) *progressEntry {
+func saveProgressEntry(uid, key string, entry *progressEntry) *progressEntry {
 	progressMu.Lock()
 	defer progressMu.Unlock()
 
 	data := loadProgress(uid)
-	prev := data[bid]
+	prev := data[key]
 	if prev == nil {
 		prev = &progressEntry{}
 	}
-	// 只更新非零字段（与 Python 版 prev.update(entry) 对齐）
 	if entry.Page != 0 || prev.Page == 0 {
 		prev.Page = entry.Page
 	}
@@ -75,7 +71,7 @@ func saveProgressEntry(uid, bid string, entry *progressEntry) *progressEntry {
 		prev.Percent = entry.Percent
 	}
 	prev.UpdatedAt = time.Now().Unix()
-	data[bid] = prev
+	data[key] = prev
 
 	raw, err := json.Marshal(data)
 	if err != nil {
@@ -92,29 +88,29 @@ func saveProgressEntry(uid, bid string, entry *progressEntry) *progressEntry {
 }
 
 func handleProgress(w http.ResponseWriter, r *http.Request, u *User) {
-	bid := r.URL.Query().Get("id")
+	raw := r.URL.Query().Get("path")
+	if raw == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	key, ok := resolveInRoots(raw)
+	if !ok {
+		http.Error(w, "book not found", http.StatusNotFound)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
 		prog := loadProgress(u.UID)
-		writeJSON(w, map[string]any{"id": bid, "progress": prog[bid]})
+		writeJSON(w, map[string]any{"path": key, "progress": prog[key]})
 
 	case http.MethodPost:
 		var payload progressEntry
-		var raw map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&raw); err == nil {
-			if v, ok := raw["id"].(string); ok && v != "" {
-				bid = v
-			}
-		}
-		// 重新解码到结构体（raw 已消费 body，改用直接 decode 一次）
-		// 注：上面已读出 id，这里用 raw 填字段更稳。
-		if bid == "" {
-			http.Error(w, "missing id", http.StatusBadRequest)
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		payload = progressFromMap(raw)
-		saved := saveProgressEntry(u.UID, bid, &payload)
+		saved := saveProgressEntry(u.UID, key, &payload)
 		writeJSON(w, map[string]any{"ok": saved != nil, "progress": saved})
 
 	default:
@@ -122,26 +118,40 @@ func handleProgress(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 }
 
-// progressFromMap 从 map 提取进度字段（宽松解析）
-func progressFromMap(m map[string]any) progressEntry {
-	e := progressEntry{}
-	if v, ok := m["page"].(float64); ok {
-		e.Page = int(v)
+// recentItems 最近阅读（按 updatedAt 降序，最多 n 条）
+func recentItems(uid string, n int) []map[string]any {
+	prog := loadProgress(uid)
+	type pair struct {
+		path string
+		pe   *progressEntry
 	}
-	if v, ok := m["frac"].(float64); ok {
-		e.Frac = v
+	var list []pair
+	for k, v := range prog {
+		if v == nil {
+			continue
+		}
+		list = append(list, pair{k, v})
 	}
-	if v, ok := m["name"].(string); ok {
-		e.Name = v
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].pe.UpdatedAt > list[j].pe.UpdatedAt
+	})
+	if len(list) > n {
+		list = list[:n]
 	}
-	if v, ok := m["scale"].(float64); ok {
-		e.Scale = v
+	out := make([]map[string]any, 0, len(list))
+	for _, it := range list {
+		p := it.path
+		// 文件已删仍可展示历史；路径校验失败也返回条目
+		name := fileNameOf(p)
+		if it.pe.Name != "" {
+			name = it.pe.Name
+		}
+		out = append(out, map[string]any{
+			"name":     name,
+			"path":     p,
+			"segments": relSegments(p),
+			"progress": it.pe,
+		})
 	}
-	if v, ok := m["totalPages"].(float64); ok {
-		e.TotalPages = int(v)
-	}
-	if v, ok := m["percent"]; ok {
-		e.Percent = v
-	}
-	return e
+	return out
 }
