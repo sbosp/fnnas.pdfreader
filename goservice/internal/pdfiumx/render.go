@@ -14,9 +14,8 @@ import (
 	"pdfreader/internal/pdfpipe"
 )
 
-// Renderer 直渲：原生 PDFium 按 FilePath 打开 + 按页光栅化。
-// multi_threaded 下 FilePath 由 worker 进程直接读盘，避免跨进程传整本。
-// 同书短缓存；同书请求串行（instance 非并发安全）；异书可并行。
+// Renderer 直渲：同进程原生 PDFium 按 FilePath 打开 + 按页光栅化。
+// 同书短缓存；同书请求串行（instance 非并发安全）；PDFium 库内另有全局锁。
 type Renderer struct {
 	eng      *Engine
 	idle     time.Duration

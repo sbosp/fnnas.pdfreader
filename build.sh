@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# PDF Reader 编译脚本（Go 后端 · 原生 PDFium CGO worker）
+# PDF Reader 编译脚本（Go 后端 · 同进程原生 PDFium CGO）
 #
 # 用法:
 #   bash build.sh                         # NAS aarch64 本机完整构建
@@ -8,8 +8,7 @@
 #   SKIP_UI=1 bash build.sh               # 只重编后端
 #
 # 架构:
-#   pdfserver      — 纯 Go（CGO_ENABLED=0），拉起 worker
-#   pdfium-worker  — CGO + libpdfium（原生渲页）
+#   pdfserver      — CGO + libpdfium（同进程渲页，无 pdfium-worker）
 #   lib/libpdfium.* — 运行时动态库
 
 set -e
@@ -93,7 +92,7 @@ else
     FETCH_ARCH=arm64
     if [ "$HOST_OS" = "Darwin" ] || { [ "$HOST_ARCH" != "aarch64" ] && [ "$HOST_ARCH" != "arm64" ]; }; then
         if [ -z "${CC:-}" ] && ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-            echo -e "${YELLOW}交叉编 pdfium-worker 需要 aarch64-linux-gnu-gcc（或在 NAS 本机构建）。${NC}"
+            echo -e "${YELLOW}交叉编 pdfserver 需要 aarch64-linux-gnu-gcc（或在 NAS 本机构建）。${NC}"
             echo "  本机调试: PDFR_NATIVE_HOST=1 SKIP_UI=1 bash build.sh"
             echo "  NAS 构建: 在 aarch64 机器上直接 bash build.sh"
             exit 1
@@ -125,16 +124,8 @@ cd "$GOSVC"
 SERVER_DIR="$FNOS_APP_DIR/app/server"
 mkdir -p "$SERVER_DIR/lib"
 
-echo -e "${YELLOW}[Step 4/4] 编译 pdfserver (纯 Go) + pdfium-worker (CGO)...${NC}"
+echo -e "${YELLOW}[Step 4/4] 编译 pdfserver（CGO 同进程 PDFium）...${NC}"
 
-# 主进程纯 Go：可交叉
-if [ "$BUILD_HOST" = "1" ]; then
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$SERVER_DIR/pdfserver" .
-else
-    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o "$SERVER_DIR/pdfserver" .
-fi
-
-# worker：必须 CGO + 对应平台 libpdfium
 if [ "$FETCH_OS" = "mac" ]; then
     export CGO_LDFLAGS="${CGO_LDFLAGS:-} -Wl,-rpath,@loader_path/lib"
 else
@@ -142,30 +133,35 @@ else
 fi
 export CGO_ENABLED=1
 if [ "$BUILD_HOST" = "1" ]; then
-    go build -trimpath -ldflags="-s -w" -o "$SERVER_DIR/pdfium-worker" ./cmd/pdfium-worker
+    go build -trimpath -ldflags="-s -w" -o "$SERVER_DIR/pdfserver" .
 else
-    GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o "$SERVER_DIR/pdfium-worker" ./cmd/pdfium-worker
+    GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o "$SERVER_DIR/pdfserver" .
 fi
 
-if [ "$FETCH_OS" = "mac" ] && [ -f "$SERVER_DIR/pdfium-worker" ]; then
-    install_name_tool -change './libpdfium.dylib' '@rpath/libpdfium.dylib' "$SERVER_DIR/pdfium-worker" 2>/dev/null || true
+if [ ! -f "$SERVER_DIR/pdfserver" ]; then
+    echo -e "${RED}错误: Go 编译失败${NC}"
+    exit 1
 fi
 
-chmod +x "$SERVER_DIR/pdfserver" "$SERVER_DIR/pdfium-worker"
+if [ "$FETCH_OS" = "mac" ]; then
+    install_name_tool -change './libpdfium.dylib' '@rpath/libpdfium.dylib' "$SERVER_DIR/pdfserver" 2>/dev/null || true
+fi
+
+chmod +x "$SERVER_DIR/pdfserver"
+rm -f "$SERVER_DIR/pdfium-worker"
 rm -f "$SERVER_DIR/lib"/libpdfium.*
 cp -a "$PDFIUM_DIR/lib"/libpdfium.* "$SERVER_DIR/lib/"
 
-echo "pdfserver:      $(ls -lh "$SERVER_DIR/pdfserver" | awk '{print $5}')"
-echo "pdfium-worker: $(ls -lh "$SERVER_DIR/pdfium-worker" | awk '{print $5}')"
-echo "libpdfium:     $(ls -lh "$SERVER_DIR/lib"/libpdfium.* | awk '{print $5}')"
-echo -e "${GREEN}后端编译完成${NC}"
+echo "pdfserver:  $(ls -lh "$SERVER_DIR/pdfserver" | awk '{print $5}')"
+echo "libpdfium: $(ls -lh "$SERVER_DIR/lib"/libpdfium.* | awk '{print $5}')"
+echo -e "${GREEN}后端编译完成（无 pdfium-worker）${NC}"
 
 if [ "$BUILD_HOST" = "1" ]; then
     cp -f "$SERVER_DIR/pdfserver" "$GOSVC/pdfserver"
-    cp -f "$SERVER_DIR/pdfium-worker" "$GOSVC/pdfium-worker"
     mkdir -p "$GOSVC/lib"
     cp -a "$PDFIUM_DIR/lib"/libpdfium.* "$GOSVC/lib/"
-    chmod +x "$GOSVC/pdfserver" "$GOSVC/pdfium-worker"
+    chmod +x "$GOSVC/pdfserver"
+    rm -f "$GOSVC/pdfium-worker"
 fi
 
 # ---------- 打包 ----------

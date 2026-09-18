@@ -1,7 +1,6 @@
 package pdfiumx
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,11 +8,11 @@ import (
 	"time"
 
 	"github.com/klippa-app/go-pdfium"
-	"github.com/klippa-app/go-pdfium/multi_threaded"
+	"github.com/klippa-app/go-pdfium/single_threaded"
 )
 
-// Engine 原生 PDFium 多进程池（CGO multi_threaded）。
-// 每个 instance 对应一个独立 worker 进程，避开 WASM 线性内存常驻。
+// Engine 同进程原生 PDFium（CGO single_threaded）。
+// 不拉起 pdfium-worker；库内全局锁保证线程安全，渲页在进程内串行。
 type Engine struct {
 	pool pdfium.Pool
 
@@ -24,69 +23,21 @@ type Engine struct {
 }
 
 type EngineConfig struct {
-	// MaxWorkers 同时存活的 worker 上限（=可并行渲页槽位数）
-	MaxWorkers int
-	// MaxOpsPerWorker 单 instance 建议回收阈值
+	MaxWorkers      int // 保留字段，single_threaded 下不限制进程数
 	MaxOpsPerWorker int
-	// WorkerBin pdfium-worker 可执行文件路径；空则自动探测
-	WorkerBin string
 }
 
 func NewEngine(cfg EngineConfig) (*Engine, error) {
-	if cfg.MaxWorkers < 1 {
-		cfg.MaxWorkers = 2
-	}
 	if cfg.MaxOpsPerWorker < 1 {
 		cfg.MaxOpsPerWorker = 30
 	}
 	setupNativeLibPath()
 
-	workerBin := cfg.WorkerBin
-	if workerBin == "" {
-		workerBin = resolveWorkerBin()
-	}
-	if st, err := os.Stat(workerBin); err != nil || st.IsDir() {
-		return nil, fmt.Errorf("pdfium worker 未找到: %s（请先编译 cmd/pdfium-worker，或设 PDFR_PDFIUM_WORKER）", workerBin)
-	}
-
-	pool := multi_threaded.Init(multi_threaded.Config{
-		MinIdle:  0,
-		MaxIdle:  0,
-		MaxTotal: cfg.MaxWorkers,
-		Command: multi_threaded.Command{
-			BinPath:      workerBin,
-			StartTimeout: 60 * time.Second,
-		},
-	})
+	pool := single_threaded.Init(single_threaded.Config{})
 	return &Engine{pool: pool, maxOps: cfg.MaxOpsPerWorker}, nil
 }
 
-func resolveWorkerBin() string {
-	if v := os.Getenv("PDFR_PDFIUM_WORKER"); v != "" {
-		return v
-	}
-	if exe, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(exe), "pdfium-worker")
-		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-			return cand
-		}
-	}
-	// 开发态：goservice 目录下
-	if cwd, err := os.Getwd(); err == nil {
-		for _, p := range []string{
-			filepath.Join(cwd, "pdfium-worker"),
-			filepath.Join(cwd, "bin", "pdfium-worker"),
-		} {
-			if st, err := os.Stat(p); err == nil && !st.IsDir() {
-				return p
-			}
-		}
-	}
-	return "pdfium-worker"
-}
-
-// setupNativeLibPath 把可执行文件旁的 lib/ 或 PDFR_PDFIUM_LIB 加入动态库搜索路径，
-// 以便主进程与 go-plugin 拉起的 worker 子进程都能找到 libpdfium。
+// setupNativeLibPath 把可执行文件旁的 lib/ 或 PDFR_PDFIUM_LIB 加入动态库搜索路径。
 func setupNativeLibPath() {
 	libDir := os.Getenv("PDFR_PDFIUM_LIB")
 	if libDir == "" {
