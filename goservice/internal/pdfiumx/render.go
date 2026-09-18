@@ -3,6 +3,7 @@ package pdfiumx
 import (
 	"fmt"
 	"image"
+	"image/draw"
 	"sync"
 	"time"
 
@@ -274,20 +275,24 @@ func (r *Renderer) RenderPageImage(path string, pageIndex0, dpi int) (image.Imag
 		r.releaseRef(d)
 		return nil, nil, fmt.Errorf("render: %w", err)
 	}
+	// 立刻拷走像素并释放 PDFium bitmap + 文档锁，编码在锁外进行。
+	img := cloneImage(pr.Result.Image)
+	pr.Cleanup()
 	d.ops++
 	d.last = time.Now()
+	d.mu.Unlock()
+	r.releaseRef(d)
+	return img, func() {}, nil
+}
 
-	done := false
-	cleanup := func() {
-		if done {
-			return
-		}
-		done = true
-		pr.Cleanup()
-		d.mu.Unlock()
-		r.releaseRef(d)
+func cloneImage(src image.Image) image.Image {
+	if src == nil {
+		return nil
 	}
-	return pr.Result.Image, cleanup, nil
+	b := src.Bounds()
+	dst := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Src)
+	return dst
 }
 
 func (r *Renderer) Close() error {

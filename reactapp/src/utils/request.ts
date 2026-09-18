@@ -41,10 +41,19 @@ request.interceptors.response.use(
 // 路径化 API 辅助：后端以「书库内真实路径」为标识（不再用 hash 编码的 id）
 // ----------------------------------------------------------------------------
 
-/** 页面图片 URL（img src 直接用）。后端返回 no-store，复用由后端磁盘缓存负责 */
-export function pageImgUrl(path: string, page: number, dpi?: number) {
+/** 页面图片 URL。pri 越小越优先（当前页 0）。 */
+export function pageImgUrl(path: string, page: number, dpi?: number, pri?: number) {
     const d = dpi ? `&dpi=${dpi}` : ''
-    return `${API_BASE}/pageimg?path=${encodeURIComponent(path)}&page=${page}${d}`
+    const p = pri != null ? `&pri=${pri}` : ''
+    return `${API_BASE}/pageimg?path=${encodeURIComponent(path)}&page=${page}${d}${p}`
+}
+
+/** 可取消的页图请求（滑走 Abort，避免堵在当前页后面） */
+export function fetchPageImage(path: string, page: number, pri: number, signal: AbortSignal, dpi?: number): Promise<Blob> {
+    return fetch(pageImgUrl(path, page, dpi, pri), {signal, credentials: 'same-origin'}).then((res) => {
+        if (!res.ok) throw new Error(`pageimg ${res.status}`)
+        return res.blob()
+    })
 }
 
 /** 书籍/目录路径编码为 hash 路由参数 */

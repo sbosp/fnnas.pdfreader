@@ -1,6 +1,6 @@
 import {memo, useCallback, useEffect, useRef, useState} from 'react'
 import {useLocation, useNavigate} from 'react-router-dom'
-import {pageImgUrl, request} from '../utils/request'
+import {fetchPageImage, request} from '../utils/request'
 import {debounce} from '../utils/UIUtils'
 import '../PdfReader.css'
 
@@ -11,10 +11,10 @@ const zoomLevels = [0.5, 0.75, 1, 1.25, 1.5, 2, 3]
 const ZOOM_STORE_KEY = 'pdfreader.zoom.scale'
 
 // ============ 加载/布局常量 ============
-const PRELOAD_AHEAD = 3      // 向下预加载页数
-const PRELOAD_BEHIND = 1     // 向上预加载页数
-const OBSERVER_ROOT_MARGIN = '800px 0px' // 提前触发加载的缓冲距离
-const KEEP_SCREENS = 2       // 视口上下保留 N 屏的图片，之外卸载防 OOM
+const FETCH_AHEAD = 2        // 当前页之后最多预取
+const FETCH_BEHIND = 1       // 当前页之前最多预取
+const FETCH_CONCURRENCY = 2  // 同时进行的页图请求
+const KEEP_SCREENS = 2       // 视口上下保留 N 屏已解码图，之外卸载防 OOM
 const DEFAULT_PAGE_WIDTH = 595
 const DEFAULT_PAGE_HEIGHT = 842
 
@@ -53,9 +53,10 @@ interface PageItem {
     origWidth: number   // 原始 pt（来自 meta，或 img 加载后按真实比例校正）
     origHeight: number
     ratio: number       // origHeight / origWidth，JS 算高度用
-    shouldLoad: boolean // observer 触发：是否渲染 img
+    shouldLoad: boolean // 在加载窗口内
     loaded: boolean     // img 加载完成
     error: boolean
+    blobUrl?: string    // fetch + object URL，可随窗口撤销
 }
 
 // ============ 单页组件（memo：只有该页状态变化才重渲染）============
@@ -82,7 +83,7 @@ const PdfPage = memo(function PdfPage(props: {
         : undefined
     return (
         <div className="image-page" data-page-num={page.pageNum} style={initStyle}>
-            {page.shouldLoad && (
+            {page.shouldLoad && imgSrc && (
                 <img
                     className="page-img"
                     src={imgSrc}
@@ -135,9 +136,17 @@ export default function PdfReader() {
     const stableClientWidthRef = useRef(0)
     // 视口高度快照：与宽度一样避免手势中反复读 DOM 触发布局
     const stableClientHeightRef = useRef(0)
-    const ioRef = useRef<IntersectionObserver | null>(null)
     const initializedRef = useRef(false)
     const pendingInitRef = useRef<{ page: number, frac: number } | null>(null)
+    const inflightRef = useRef(new Map<number, AbortController>())
+    const blobRef = useRef(new Map<number, string>())
+    const bookPathRef = useRef(bookPath)
+    bookPathRef.current = bookPath
+    const bookNameRef = useRef(bookName)
+    bookNameRef.current = bookName
+    const startFetchRef = useRef<(pn: number, pri: number) => void>(() => {})
+    const pumpFetchesRef = useRef<() => void>(() => {})
+    const syncLoadWindowRef = useRef<() => void>(() => {})
 
     // 双指手势状态。
     //
@@ -339,49 +348,137 @@ export default function PdfReader() {
     }, [])
 
     const retryPage = useCallback((pageNum: number) => {
-        updatePage(pageNum, {error: false, loaded: false, shouldLoad: true})
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [])
-
-    // ============ IntersectionObserver 懒加载 ============
-    const markLoad = useCallback((pageNum: number) => {
-        const list = pagesRef.current
-        if (pageNum < 0 || pageNum >= list.length) return
-        if (!list[pageNum].shouldLoad && !list[pageNum].loaded) {
-            updatePage(pageNum, {shouldLoad: true})
+        const ac = inflightRef.current.get(pageNum)
+        ac?.abort()
+        inflightRef.current.delete(pageNum)
+        const old = blobRef.current.get(pageNum)
+        if (old) {
+            URL.revokeObjectURL(old)
+            blobRef.current.delete(pageNum)
         }
+        updatePage(pageNum, {error: false, loaded: false, shouldLoad: true, blobUrl: undefined})
+        startFetchRef.current(pageNum, 0)
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
 
-    const setupObserver = useCallback(() => {
+    // ============ 视口窗口加载：只拉附近页，滑走 Abort，当前页 pri=0 插队 ============
+    const getCenterPageIndex = () => {
         const vp = viewportRef.current
-        if (!vp) return
-        ioRef.current = new IntersectionObserver((entries) => {
-            for (const entry of entries) {
-                const pn = parseInt((entry.target as HTMLElement).dataset.pageNum || '-1', 10)
-                if (pn < 0) continue
-                if (entry.isIntersecting) {
-                    markLoad(pn)
-                    for (let k = 1; k <= PRELOAD_AHEAD; k++) markLoad(pn + k)
-                    for (let k = 1; k <= PRELOAD_BEHIND; k++) markLoad(pn - k)
-                }
-            }
-        }, {root: vp, rootMargin: OBSERVER_ROOT_MARGIN, threshold: 0.01})
-        vp.querySelectorAll('.image-page').forEach(el => ioRef.current!.observe(el))
-    }, [markLoad])
+        const list = pagesRef.current
+        if (!vp || !list.length) return 0
+        const viewCenter = vp.scrollTop + vp.clientHeight / 2
+        let acc = 0
+        for (let i = 0; i < list.length; i++) {
+            const h = pageDisplayHeight(list[i]) + 20
+            if (viewCenter >= acc && viewCenter < acc + h) return i
+            acc += h
+        }
+        return Math.max(0, list.length - 1)
+    }
 
-    const teardownObserver = useCallback(() => {
-        ioRef.current?.disconnect()
-        ioRef.current = null
-    }, [])
+    const desiredWindow = (center: number, total: number) => {
+        const out: {pn: number, pri: number}[] = []
+        const push = (pn: number, pri: number) => {
+            if (pn >= 0 && pn < total) out.push({pn, pri})
+        }
+        push(center, 0)
+        for (let k = 1; k <= FETCH_AHEAD; k++) push(center + k, k)
+        for (let k = 1; k <= FETCH_BEHIND; k++) push(center - k, k)
+        return out
+    }
+
+    const abortPageFetch = (pn: number) => {
+        const ac = inflightRef.current.get(pn)
+        if (!ac) return
+        ac.abort()
+        inflightRef.current.delete(pn)
+    }
+
+    const revokePageBlob = (pn: number) => {
+        const u = blobRef.current.get(pn)
+        if (!u) return
+        URL.revokeObjectURL(u)
+        blobRef.current.delete(pn)
+    }
+
+    const abortAllFetches = () => {
+        inflightRef.current.forEach((ac) => ac.abort())
+        inflightRef.current.clear()
+        blobRef.current.forEach((u) => URL.revokeObjectURL(u))
+        blobRef.current.clear()
+    }
+
+    startFetchRef.current = (pn: number, pri: number) => {
+        const path = bookPathRef.current
+        if (!path) return
+        const list = pagesRef.current
+        const p = list[pn]
+        if (!p || p.loaded || p.blobUrl || inflightRef.current.has(pn)) return
+        const ac = new AbortController()
+        inflightRef.current.set(pn, ac)
+        fetchPageImage(path, pn, pri, ac.signal)
+            .then((blob) => {
+                if (ac.signal.aborted) return
+                revokePageBlob(pn)
+                const url = URL.createObjectURL(blob)
+                blobRef.current.set(pn, url)
+                inflightRef.current.delete(pn)
+                updatePage(pn, {shouldLoad: true, error: false, blobUrl: url})
+            })
+            .catch((e) => {
+                inflightRef.current.delete(pn)
+                if (e?.name === 'AbortError' || ac.signal.aborted) return
+                updatePage(pn, {loaded: false, error: true, shouldLoad: false, blobUrl: undefined})
+            })
+            .finally(() => {
+                pumpFetchesRef.current()
+            })
+    }
+
+    pumpFetchesRef.current = () => {
+        const list = pagesRef.current
+        if (!list.length) return
+        const want = desiredWindow(getCenterPageIndex(), list.length)
+        for (const {pn, pri} of want) {
+            if (inflightRef.current.size >= FETCH_CONCURRENCY) return
+            const p = list[pn]
+            if (!p || p.loaded || p.blobUrl || inflightRef.current.has(pn)) continue
+            startFetchRef.current(pn, pri)
+        }
+    }
+
+    syncLoadWindowRef.current = () => {
+        const list = pagesRef.current
+        if (!list.length) return
+        const want = desiredWindow(getCenterPageIndex(), list.length)
+        const wantSet = new Set(want.map((w) => w.pn))
+
+        for (const pn of [...inflightRef.current.keys()]) {
+            if (!wantSet.has(pn)) abortPageFetch(pn)
+        }
+
+        let changed = false
+        const next = list.map((p) => {
+            const inWant = wantSet.has(p.pageNum)
+            if (inWant) {
+                if (!p.shouldLoad) {
+                    changed = true
+                    return {...p, shouldLoad: true, error: false}
+                }
+                return p
+            }
+            if (!p.loaded && (p.shouldLoad || p.blobUrl)) {
+                revokePageBlob(p.pageNum)
+                changed = true
+                return {...p, shouldLoad: false, error: false, blobUrl: undefined}
+            }
+            return p
+        })
+        if (changed) setPages(next)
+        pumpFetchesRef.current()
+    }
 
     // ============ 滚动处理 ============
-    // 用 ref 持有最新的书路径/书名，避免 debounce 闭包捕获旧值
-    const bookPathRef = useRef(bookPath)
-    bookPathRef.current = bookPath
-    const bookNameRef = useRef(bookName)
-    bookNameRef.current = bookName
-
     const saveProgress = useRef(debounce(async (pageNum: number, fraction: number) => {
         const p = bookPathRef.current
         if (!p) return
@@ -455,9 +552,12 @@ export default function PdfReader() {
         const list = pagesRef.current
         let changed = false
         const next = list.map(p => {
-            if (keep.has(p.pageNum) || !p.shouldLoad) return p
+            if (keep.has(p.pageNum) || (!p.shouldLoad && !p.loaded && !p.blobUrl)) return p
+            if (keep.has(p.pageNum)) return p
+            abortPageFetch(p.pageNum)
+            revokePageBlob(p.pageNum)
             changed = true
-            return {...p, shouldLoad: false, loaded: false}
+            return {...p, shouldLoad: false, loaded: false, blobUrl: undefined}
         })
         if (changed) setPages(next)
     }, 300)).current
@@ -466,6 +566,7 @@ export default function PdfReader() {
         // 双指缩放每帧都在改 scrollTop，这里若跟着跑会把「卸载」误触发在半新半旧布局上
         if (pinchRef.current.pinching) return
         updateCurrentPageFromScroll()
+        syncLoadWindowRef.current()
         scheduleUnloadInvisible()
     }, [updateCurrentPageFromScroll, scheduleUnloadInvisible])
 
@@ -542,10 +643,10 @@ export default function PdfReader() {
         if (pages.length === 0 || initializedRef.current) return
         initializedRef.current = true
         applyTrackWidth()
-        setupObserver()
         const pend = pendingInitRef.current
         if (pend) scrollToPage(pend.page, pend.frac)
         centerHorizontally()
+        requestAnimationFrame(() => syncLoadWindowRef.current())
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [pages])
 
@@ -707,7 +808,8 @@ export default function PdfReader() {
                 vp.removeEventListener('touchcancel', onTouchEnd)
             }
             window.removeEventListener('resize', handleResize)
-            teardownObserver()
+            abortAllFetches()
+            initializedRef.current = false
             setPages([])
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -742,7 +844,7 @@ export default function PdfReader() {
                         <PdfPage
                             key={page.pageNum}
                             page={page}
-                            imgSrc={pageImgUrl(bookPath, page.pageNum)}
+                            imgSrc={page.blobUrl || ''}
                             widthRef={pageWidthGetterRef}
                             onLoaded={onLoaded}
                             onError={onError}

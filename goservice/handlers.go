@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"strconv"
@@ -123,6 +125,10 @@ func handlePageImage(w http.ResponseWriter, r *http.Request, u *User) {
 	if d, err := strconv.Atoi(r.URL.Query().Get("dpi")); err == nil && d > 0 {
 		dpi = d
 	}
+	pri := 10
+	if n, err := strconv.Atoi(r.URL.Query().Get("pri")); err == nil {
+		pri = n
+	}
 
 	p, ok := resolveInRoots(raw)
 	if !ok {
@@ -135,8 +141,11 @@ func handlePageImage(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 
-	data, contentType, renderMs, compressMs, fromCache, err := pdfSvc.RenderPageTimed(p, page, dpi)
+	data, contentType, renderMs, compressMs, fromCache, err := pdfSvc.RenderPageTimed(r.Context(), p, page, dpi, pri)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		logf("渲染失败 %s p%d: %v", fileNameOf(p), page, err)
 		http.Error(w, "render failed", http.StatusInternalServerError)
 		return

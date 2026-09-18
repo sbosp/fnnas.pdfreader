@@ -18,7 +18,7 @@ type PagePDF struct {
 // PageRenderer 直渲：FileReader 打开、按页光栅化。不得整本 ReadFile。
 type PageRenderer interface {
 	Meta(path string) (DocMeta, error)
-	// RenderPageImage 返回页面位图；必须调用 cleanup 释放 PDFium 资源。
+	// RenderPageImage 返回独立拷贝的页面位图（可在文档锁外编码）。cleanup 可为空。
 	RenderPageImage(path string, pageIndex0, dpi int) (img image.Image, cleanup func(), err error)
 	Close() error
 }
