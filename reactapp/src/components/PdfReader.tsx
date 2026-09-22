@@ -29,6 +29,17 @@ function pathFromLocation(pathname: string): string {
     }
 }
 
+/** 离开阅读页应落到的书架路径（不要 navigate(-1)，飞牛 WebView 会把 App 整页弹出） */
+function readerExitPath(location: {pathname: string, state: unknown}, bookPath: string): string {
+    const from = (location.state as {from?: string} | null)?.from
+    if (from && from.startsWith('/') && !from.startsWith('/read')) return from
+    const slash = bookPath.lastIndexOf('/')
+    if (slash > 0) {
+        return `/browse/${encodeURIComponent(bookPath.slice(0, slash))}`
+    }
+    return '/'
+}
+
 // ============ 缩放比例本地持久化 ============
 function loadLocalScale(): number {
     try {
@@ -595,13 +606,13 @@ export default function PdfReader() {
     const loadMeta = useCallback(async () => {
         if (!bookPath) return
         try {
-            // meta（页数+尺寸）与 progress（阅读进度）并行请求。
-            // 两者都不走浏览器缓存（后端 no-store），后端改动/换书能立即生效；
-            // 页面图片的复用靠后端磁盘缓存（书库 .pdfreader-cache），不依赖浏览器缓存。
+            // meta 与页图走浏览器 7 天缓存（文件 mtime/size 变则 ETag 失效）
             const pq = encodeURIComponent(bookPath)
             const [metaRes, progRes] = await Promise.all([
                 request.get(`meta?path=${pq}`),
-                request.get(`progress?path=${pq}`),
+                request.get(`progress?path=${pq}`, {
+                    headers: {'Cache-Control': 'no-cache'},
+                }),
             ])
             const data = metaRes.data
             const prog = progRes.data?.progress
@@ -815,7 +826,21 @@ export default function PdfReader() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [bookPath])
 
-    const close = () => navigate(-1)
+    // 系统返回键：飞牛 App 是 iframe/WebView，hash 栈经常只有阅读页这一层，
+    // navigate(-1) 会把整个应用弹出。压一层 trap，返回时改写到书架而不是出 App。
+    const leaveReaderRef = useRef(() => {})
+    leaveReaderRef.current = () => {
+        navigate(readerExitPath(location, bookPath), {replace: true})
+    }
+    useEffect(() => {
+        window.history.pushState({pdfReaderTrap: 1}, '')
+        const onPop = () => leaveReaderRef.current()
+        window.addEventListener('popstate', onPop)
+        return () => window.removeEventListener('popstate', onPop)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [])
+
+    const close = () => window.history.back()
     const zoomLabel = `${Math.round(scale * 100)}%`
 
     return (

@@ -22,7 +22,7 @@ func (c *Config) normalize() {
 		c.Concurrency = 32
 	}
 	if c.DefaultDPI < 36 {
-		c.DefaultDPI = 200
+		c.DefaultDPI = 300
 	}
 	if c.JPEGQuality < 1 || c.JPEGQuality > 100 {
 		c.JPEGQuality = 80

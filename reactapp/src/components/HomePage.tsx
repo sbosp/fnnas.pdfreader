@@ -131,7 +131,9 @@ export default function HomePage() {
         }
     }, [items, keyword])
 
-    const openBook = (it: Item) => navigate(`/read/${encodeURIComponent(it.path)}`)
+    const openBook = (it: Item) => navigate(`/read/${encodeURIComponent(it.path)}`, {
+        state: {from: location.pathname},
+    })
     const enterFolder = (it: Item) => navigate(`/browse/${encodeURIComponent(it.path)}`)
     const goPath = (p: string) => navigate(`/browse/${encodeURIComponent(p)}`)
     const goHome = () => navigate('/')

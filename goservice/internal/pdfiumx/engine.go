@@ -4,8 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
-	"time"
 
 	"github.com/klippa-app/go-pdfium"
 	"github.com/klippa-app/go-pdfium/single_threaded"
@@ -14,12 +12,8 @@ import (
 // Engine 同进程原生 PDFium（CGO single_threaded）。
 // 不拉起 pdfium-worker；库内全局锁保证线程安全，渲页在进程内串行。
 type Engine struct {
-	pool pdfium.Pool
-
+	pool   pdfium.Pool
 	maxOps int
-
-	mu       sync.Mutex
-	opsCount int
 }
 
 type EngineConfig struct {
@@ -72,16 +66,7 @@ func (e *Engine) CloseInstance(inst pdfium.Pdfium) {
 		return
 	}
 	_ = inst.Close()
-	e.mu.Lock()
-	e.opsCount++
-	n := e.opsCount
-	e.mu.Unlock()
-	if n%8 == 0 {
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			freeOSMemory()
-		}()
-	}
+	ReclaimMemory()
 }
 
 func (e *Engine) MaxOps() int { return e.maxOps }

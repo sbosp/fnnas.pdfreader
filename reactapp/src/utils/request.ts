@@ -14,6 +14,7 @@ export const request: AxiosInstance = axios.create({
     baseURL: API_BASE + '/',
     timeout: 30000, // 大书首次渲染较慢，留足余量
     headers: {},
+    // 不主动发 Cache-Control/Pragma，让浏览器按接口 Cache-Control 缓存 meta
 })
 
 request.interceptors.request.use(
@@ -41,16 +42,22 @@ request.interceptors.response.use(
 // 路径化 API 辅助：后端以「书库内真实路径」为标识（不再用 hash 编码的 id）
 // ----------------------------------------------------------------------------
 
-/** 页面图片 URL。pri 越小越优先（当前页 0）。 */
-export function pageImgUrl(path: string, page: number, dpi?: number, pri?: number) {
+/** 页面图片 URL（不含 pri，便于浏览器按 URL 缓存 7 天） */
+export function pageImgUrl(path: string, page: number, dpi?: number) {
     const d = dpi ? `&dpi=${dpi}` : ''
-    const p = pri != null ? `&pri=${pri}` : ''
-    return `${API_BASE}/pageimg?path=${encodeURIComponent(path)}&page=${page}${d}${p}`
+    return `${API_BASE}/pageimg?path=${encodeURIComponent(path)}&page=${page}${d}`
 }
 
-/** 可取消的页图请求（滑走 Abort，避免堵在当前页后面） */
+/** 可取消的页图请求。pri 走请求头，不进 URL，避免拆散 HTTP 缓存。 */
 export function fetchPageImage(path: string, page: number, pri: number, signal: AbortSignal, dpi?: number): Promise<Blob> {
-    return fetch(pageImgUrl(path, page, dpi, pri), {signal, credentials: 'same-origin'}).then((res) => {
+    const headers: Record<string, string> = {}
+    if (pri != null) headers['X-Page-Pri'] = String(pri)
+    return fetch(pageImgUrl(path, page, dpi), {
+        signal,
+        credentials: 'same-origin',
+        cache: 'default',
+        headers,
+    }).then((res) => {
         if (!res.ok) throw new Error(`pageimg ${res.status}`)
         return res.blob()
     })

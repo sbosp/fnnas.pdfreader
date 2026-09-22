@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -11,6 +12,21 @@ import (
 
 	"pdfreader/internal/pdfpipe"
 )
+
+const browserCacheMaxAge = 7 * 24 * 3600 // 7 天，给前端 HTTP 缓存
+
+func setBrowserCache(w http.ResponseWriter, etag string) {
+	w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", browserCacheMaxAge))
+	w.Header().Set("ETag", etag)
+}
+
+func setNoStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+}
+
+func etagMatch(r *http.Request, etag string) bool {
+	return r.Header.Get("If-None-Match") == etag
+}
 
 var pdfSvc *pdfpipe.Service
 
@@ -20,6 +36,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func handleMe(w http.ResponseWriter, r *http.Request, u *User) {
+	setNoStore(w)
 	writeJSON(w, map[string]any{
 		"uid":      u.UID,
 		"username": u.Username,
@@ -28,6 +45,7 @@ func handleMe(w http.ResponseWriter, r *http.Request, u *User) {
 }
 
 func handleList(w http.ResponseWriter, r *http.Request, u *User) {
+	setNoStore(w)
 	raw := r.URL.Query().Get("path")
 	var entries []Entry
 	var crumbs []crumb
@@ -80,6 +98,7 @@ func handleList(w http.ResponseWriter, r *http.Request, u *User) {
 }
 
 func handleRecent(w http.ResponseWriter, r *http.Request, u *User) {
+	setNoStore(w)
 	writeJSON(w, map[string]any{"items": recentItems(u.UID, 12)})
 }
 
@@ -96,13 +115,20 @@ func handleMeta(w http.ResponseWriter, r *http.Request, u *User) {
 		http.Error(w, "book not found", http.StatusNotFound)
 		return
 	}
+	etag := fmt.Sprintf(`"meta-%d-%d"`, st.ModTime().Unix(), st.Size())
+	if etagMatch(r, etag) {
+		setBrowserCache(w, etag)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	meta, err := pdfSvc.Meta(p)
 	if err != nil {
 		logf("meta error %s: %v", fileNameOf(p), err)
+		setNoStore(w)
 		http.Error(w, "meta failed", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	setBrowserCache(w, etag)
 	writeJSON(w, map[string]any{
 		"path":      p,
 		"name":      fileNameOf(p),
@@ -129,6 +155,11 @@ func handlePageImage(w http.ResponseWriter, r *http.Request, u *User) {
 	if n, err := strconv.Atoi(r.URL.Query().Get("pri")); err == nil {
 		pri = n
 	}
+	if h := r.Header.Get("X-Page-Pri"); h != "" {
+		if n, err := strconv.Atoi(h); err == nil {
+			pri = n
+		}
+	}
 
 	p, ok := resolveInRoots(raw)
 	if !ok {
@@ -141,12 +172,20 @@ func handlePageImage(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 
+	etag := fmt.Sprintf(`"pimg-%d-%d-%d-%d"`, st.ModTime().Unix(), st.Size(), page, dpi)
+	if etagMatch(r, etag) {
+		setBrowserCache(w, etag)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
 	data, contentType, renderMs, compressMs, fromCache, err := pdfSvc.RenderPageTimed(r.Context(), p, page, dpi, pri)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
 		logf("渲染失败 %s p%d: %v", fileNameOf(p), page, err)
+		setNoStore(w)
 		http.Error(w, "render failed", http.StatusInternalServerError)
 		return
 	}
@@ -160,8 +199,8 @@ func handlePageImage(w http.ResponseWriter, r *http.Request, u *User) {
 		logf("渲染 %s 第%d页(dpi=%d) %s %dKB render=%dms compress=%dms total=%.3fs",
 			fileNameOf(p), page, dpi, contentType, len(data)/1024, renderMs, compressMs, time.Since(start).Seconds())
 	}
+	setBrowserCache(w, etag)
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	_, _ = w.Write(data)
 }
 

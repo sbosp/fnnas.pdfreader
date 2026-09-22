@@ -88,6 +88,7 @@ func saveProgressEntry(uid, key string, entry *progressEntry) *progressEntry {
 }
 
 func handleProgress(w http.ResponseWriter, r *http.Request, u *User) {
+	setNoStore(w)
 	raw := r.URL.Query().Get("path")
 	if raw == "" {
 		http.Error(w, "missing path", http.StatusBadRequest)

@@ -74,7 +74,7 @@ func (r *Renderer) reaper() {
 			r.destroyDoc(d)
 		}
 		if len(victims) > 0 {
-			freeOSMemory()
+			ReclaimMemory()
 		}
 	}
 }
@@ -306,5 +306,6 @@ func (r *Renderer) Close() error {
 	for _, d := range victims {
 		r.destroyDoc(d)
 	}
+	ReclaimMemory()
 	return nil
 }

@@ -41,8 +41,8 @@ func main() {
 
 	logf("=== pdfreader go server boot === prefix=%s webroot=%s data=%s",
 		cfg.GatewayPrefix, cfg.WebRoot, cfg.DataDir)
-	logf("pipeline: 同进程原生PDFium(FilePath)直渲 → WebP(%s/%s) | concurrency=%d dpi=%d docCache=%d | 无 pdfium-worker",
-		cfg.CompressMode, cfg.CompressLevel, cfg.RenderConcurrency, cfg.DefaultDPI, cfg.DocCacheSize)
+	logf("pipeline: 同进程原生PDFium(FilePath)直渲 → WebP(%s/%s) | concurrency=%d dpi=%d docCache=%d idle=%ds | 闲置后关文档并回收堆",
+		cfg.CompressMode, cfg.CompressLevel, cfg.RenderConcurrency, cfg.DefaultDPI, cfg.DocCacheSize, cfg.DocIdleSecs)
 	logf("roots=%v", collectRoots())
 
 	mux := http.NewServeMux()

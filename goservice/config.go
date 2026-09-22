@@ -65,7 +65,7 @@ func loadConfig(port int, host string) Config {
 		RenderConcurrency: envInt("PDFR_RENDER_CONCURRENCY", 10),
 		DocIdleSecs:       envInt("PDFR_DOC_IDLE_SECS", 120),
 		DocCacheSize:      envInt("PDFR_DOC_CACHE_SIZE", 3),
-		DefaultDPI:        envInt("PDFR_RENDER_DPI", 200),
+		DefaultDPI:        envInt("PDFR_RENDER_DPI", 300),
 		CompressMode:      strings.ToLower(envOr("PDFR_COMPRESS", "smart")),
 		CompressLevel:     strings.ToLower(envOr("PDFR_COMPRESS_LEVEL", "high")),
 		JPEGQuality:       envInt("PDFR_JPEG_QUALITY", 78),
@@ -80,7 +80,7 @@ func loadConfig(port int, host string) Config {
 		c.DocCacheSize = 3
 	}
 	if c.DefaultDPI < 36 {
-		c.DefaultDPI = 200
+		c.DefaultDPI = 300
 	}
 	if c.JPEGQuality < 1 || c.JPEGQuality > 100 {
 		c.JPEGQuality = 78
