@@ -21,6 +21,7 @@ export PDFR_SHARE_PATHS="${TRIM_DATA_SHARE_PATHS}"
 export PDFR_ACCESSIBLE_PATHS="${TRIM_DATA_ACCESSIBLE_PATHS}"
 export PDFR_ROOTS_FILE="${TRIM_PKGVAR}/roots.txt"
 export PDFR_PDFIUM_LIB="${LIB_DIR}"
+export PDFR_RENDER_DPI="300"
 # 兜底：无 rpath 时仍能找到 libpdfium.so
 if [ -d "${LIB_DIR}" ]; then
     export LD_LIBRARY_PATH="${LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

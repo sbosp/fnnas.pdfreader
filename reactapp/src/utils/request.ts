@@ -10,6 +10,9 @@ declare module 'axios' {
 // 统一飞牛网关前缀
 export const API_BASE = '/app/fnnas-pdfreader/api'
 
+/** 正文页渲染 DPI（写入磁盘缓存目录名，须与后端一致） */
+export const PAGE_DPI = 300
+
 export const request: AxiosInstance = axios.create({
     baseURL: API_BASE + '/',
     timeout: 30000, // 大书首次渲染较慢，留足余量
@@ -42,14 +45,13 @@ request.interceptors.response.use(
 // 路径化 API 辅助：后端以「书库内真实路径」为标识（不再用 hash 编码的 id）
 // ----------------------------------------------------------------------------
 
-/** 页面图片 URL（不含 pri，便于浏览器按 URL 缓存 7 天） */
-export function pageImgUrl(path: string, page: number, dpi?: number) {
-    const d = dpi ? `&dpi=${dpi}` : ''
-    return `${API_BASE}/pageimg?path=${encodeURIComponent(path)}&page=${page}${d}`
+/** 页面图片 URL。dpi 写入 query，后端按此渲图并落到 `{dpi}/` 目录。 */
+export function pageImgUrl(path: string, page: number, dpi: number = PAGE_DPI) {
+    return `${API_BASE}/pageimg?path=${encodeURIComponent(path)}&page=${page}&dpi=${dpi}`
 }
 
 /** 可取消的页图请求。pri 走请求头，不进 URL，避免拆散 HTTP 缓存。 */
-export function fetchPageImage(path: string, page: number, pri: number, signal: AbortSignal, dpi?: number): Promise<Blob> {
+export function fetchPageImage(path: string, page: number, pri: number, signal: AbortSignal, dpi: number = PAGE_DPI): Promise<Blob> {
     const headers: Record<string, string> = {}
     if (pri != null) headers['X-Page-Pri'] = String(pri)
     return fetch(pageImgUrl(path, page, dpi), {
